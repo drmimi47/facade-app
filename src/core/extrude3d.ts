@@ -43,14 +43,14 @@ import { buildSunPathGeometry, type SolarSettings, type SunPathGeometry, type V3
 export const DEFAULT_WALL_HEIGHT_FT = 13;
 
 /** A point in 3D model space (X east, Y north, Z up). */
-interface Vec3 {
+export interface Vec3 {
   x: number;
   y: number;
   z: number;
 }
 
 /** A 2D projected point plus a depth value (for painter's sorting). */
-interface Projected {
+export interface Projected {
   x: number;
   y: number;
   depth: number;
@@ -169,8 +169,12 @@ export function buildMassing(
  *
  * Returns an array of length `outlineLen`; index `outlineLen-1` (the final point)
  * is unused for walls but filled defensively with the last edge index.
+ *
+ * Exported because the unroll transition (core/unrollAnim.ts) walks the SAME
+ * flattened outline and needs each link's originating edge to resolve per-panel
+ * heights and gap positions — sharing this keeps the two in lockstep.
  */
-function buildEdgeMap(p: Perimeter, outlineLen: number): number[] {
+export function buildEdgeMap(p: Perimeter, outlineLen: number): number[] {
   const v = p.vertices;
   const map: number[] = new Array(outlineLen).fill(0);
   // The first outline point is the start of edge 0.
@@ -234,8 +238,12 @@ export const PLAN_CAMERA: Camera = { azimuth: 0, elevation: Math.PI / 2 };
 /**
  * Project a 3D model point to 2D (pre-fit) coordinates with a depth value.
  * Orthographic: no divide-by-z, so no degenerate behaviour for any input.
+ *
+ * Exported so the unroll transition (core/unrollAnim.ts) paints its animated
+ * massing through the EXACT same projection as the thumbnails — the transition's
+ * end frame must land pixel-on-pixel with the 2D elevation view.
  */
-function project(pt: Vec3, cam: Camera): Projected {
+export function project(pt: Vec3, cam: Camera): Projected {
   const ca = Math.cos(cam.azimuth);
   const sa = Math.sin(cam.azimuth);
   // Rotate about Z (azimuth): spins the ground plane.
@@ -335,8 +343,8 @@ function cssNum(el: HTMLElement, name: string, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
 }
 
-/** An RGBA colour, channels 0–255, alpha 0–1. (Internal to the fog blend.) */
-interface RGBA {
+/** An RGBA colour, channels 0–255, alpha 0–1. (Used by the fog blend + unroll tweens.) */
+export interface RGBA {
   r: number;
   g: number;
   b: number;
@@ -349,7 +357,7 @@ interface RGBA {
  * actually use — `#rgb`, `#rrggbb`, and `rgb()/rgba()`. Anything unrecognised falls
  * back to opaque black so a bad token degrades visibly rather than throwing.
  */
-function parseColor(str: string): RGBA {
+export function parseColor(str: string): RGBA {
   const s = str.trim();
   // Hex: #rgb or #rrggbb.
   if (s[0] === "#") {
@@ -386,7 +394,7 @@ function parseColor(str: string): RGBA {
  * a small depth-driven amount. Kept tiny and allocation-light — the three fixed
  * colours are parsed ONCE by the caller, so this only does arithmetic per face.
  */
-function mixColor(a: RGBA, b: RGBA, t: number): string {
+export function mixColor(a: RGBA, b: RGBA, t: number): string {
   const r = Math.round(a.r + (b.r - a.r) * t);
   const g = Math.round(a.g + (b.g - a.g) * t);
   const bl = Math.round(a.b + (b.b - a.b) * t);

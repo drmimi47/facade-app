@@ -59,8 +59,12 @@ function edgeLength(a: Vertex, b: Vertex): number {
  * Signed area of the (flattened) closed outline. With model +Y pointing up, a
  * POSITIVE signed area means the vertices wind counter-clockwise. Used to decide
  * whether to reverse edge order so the unravel proceeds clockwise.
+ *
+ * Exported so the unroll TRANSITION (core/unrollAnim.ts) can make the identical
+ * ordering decision — the animation must land on exactly the layout this module
+ * produces, so both must agree on which way round the walls are read.
  */
-function isCounterClockwise(p: Perimeter): boolean {
+export function isCounterClockwise(p: Perimeter): boolean {
   const pts = flattenPerimeter(p);
   const n = pts.length - 1; // last point duplicates the first on a closed loop
   if (n < 3) return false;

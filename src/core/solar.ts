@@ -20,12 +20,18 @@
  *     CLOCKWISE (0 = N, 90 = E, 180 = S, 270 = W) — the surveyor/compass
  *     convention — so it composes directly with a building's cardinal orientation.
  *
- * What is SIMPLIFIED for now (and flagged for the Mapbox-accuracy stage):
- *   - `hour` is treated as LOCAL APPARENT SOLAR TIME (solar noon = 12:00), NOT
- *     wall-clock time. Converting clock time → solar time needs the site's
- *     longitude, its timezone meridian, and the equation of time. Longitude is
- *     already carried in {@link SolarSettings} (defaulted to Omaha) so that upgrade
- *     is a localized change here. Until then the UI labels the control "solar time".
+ * TIME: `hour` is stored as LOCAL APPARENT SOLAR TIME (solar noon = 12:00), which is
+ * what the astronomy above consumes. {@link solarToClock} / {@link clockToSolar}
+ * convert that to and from wall-clock time using the site's longitude, its time-zone
+ * meridian, and the equation of time — so the UI can present either without any of
+ * the geometry below changing. The zone comes from the offline gazetteer
+ * (core/gazetteer.ts) when an address is resolved.
+ *
+ * What is still SIMPLIFIED:
+ *   - The equation of time uses the standard engineering approximation (good to well
+ *     under a minute), not the full VSOP-grade series.
+ *   - Atmospheric refraction near the horizon is not modelled, so altitudes within
+ *     ~0.5 degrees of sunrise/sunset are geometric rather than apparent.
  *
  * Orientation model (the data the rest of the app will build cardinal facades on):
  *   - The drawn perimeter lives in model space with +X = EAST, +Y = NORTH, +Z = UP
@@ -52,22 +58,43 @@ export interface V3 {
 export interface SolarSettings {
   /** Compass bearing (deg, CW from true north) of the model's +Y axis. 0 = +Y is north. */
   northOffset: number;
-  /** Site latitude (deg, +N). Until Mapbox geocoding fills it, defaults to Omaha. */
+  /** Site latitude (deg, +N). Resolved from the Location address, else the Omaha default. */
   latitude: number;
-  /** Site longitude (deg, +E / −W). Reserved for Mapbox-accurate solar↔clock time. */
+  /** Site longitude (deg, +E / −W). Drives the solar↔clock time correction. */
   longitude: number;
   /** Day of the year, 1..365 (selects the declination / season). */
   dayOfYear: number;
   /** Local apparent SOLAR time, 0..24 (12 = solar noon). */
   hour: number;
+  /**
+   * IANA time-zone name for the site (e.g. "America/Chicago"), used to turn `hour`
+   * into wall-clock time. Resolved from the address; the browser's own Intl data
+   * supplies the UTC offset, so no time-zone database ships with the app.
+   */
+  timeZone: string;
+  /**
+   * Site elevation, METRES above sea level. Feeds Hottel's clear-sky transmittance in
+   * core/radiation.ts — higher sites see a thinner atmosphere and more direct beam.
+   */
+  elevationM: number;
 }
 
 /**
- * Temporary site coordinates until the planned Mapbox geocoder supplies real ones
- * from the typed address — chosen here as Omaha, Nebraska (per the project's
- * interim default). Used as the latitude/longitude default in {@link defaultSolarSettings}.
+ * Default site used until the user resolves an address — Omaha, Nebraska (the
+ * project's established default). Values match what the offline gazetteer returns for
+ * "Omaha", so the default site and a resolved one are described identically.
+ * Used by {@link defaultSolarSettings}.
  */
-export const OMAHA = { latitude: 41.2565, longitude: -95.9345 };
+export const OMAHA = {
+  // Same figures the offline gazetteer returns for Omaha, and the same ones
+  // savedPerimeters' defaultLocation() carries — one site, described identically in both
+  // places, so a study driven by this fallback and one driven by the resolved location
+  // can never report different coordinates for the same city.
+  latitude: 41.26,
+  longitude: -95.94,
+  timeZone: "America/Chicago",
+  elevationM: 320,
+};
 
 /** Day-of-year of the reference seasons (non-leap year), used for the guide arcs. */
 export const SEASON_DAYS = {
@@ -87,17 +114,29 @@ export function defaultSolarSettings(): SolarSettings {
     longitude: OMAHA.longitude,
     dayOfYear: SEASON_DAYS.summer,
     hour: 12,
+    timeZone: OMAHA.timeZone,
+    elevationM: OMAHA.elevationM,
   };
 }
 
-/** Deep-copy solar settings so a stored snapshot is detached from live state. */
+/**
+ * Deep-copy solar settings so a stored snapshot is detached from live state.
+ *
+ * This is also the LOAD path for saved projects, so it backfills the fields added
+ * after the format shipped. Entries written before then carry them as `undefined` at
+ * runtime even though the type says otherwise, hence the widened read below — without
+ * it an older project would drive the radiation model with `NaN` elevation.
+ */
 export function cloneSolarSettings(s: SolarSettings): SolarSettings {
+  const legacy = s as Partial<SolarSettings>;
   return {
     northOffset: s.northOffset,
     latitude: s.latitude,
     longitude: s.longitude,
     dayOfYear: s.dayOfYear,
     hour: s.hour,
+    timeZone: legacy.timeZone ?? OMAHA.timeZone,
+    elevationM: typeof legacy.elevationM === "number" ? legacy.elevationM : OMAHA.elevationM,
   };
 }
 
@@ -205,6 +244,113 @@ export function dayOfYearToDate(dayOfYear: number): { month: number; day: number
 export function formatDayOfYear(dayOfYear: number): string {
   const { month, day } = dayOfYearToDate(dayOfYear);
   return `${MONTH_ABBR[month - 1]} ${day}`;
+}
+
+// ---------------------------------------------------------------------------
+// SOLAR TIME <-> CLOCK TIME
+//
+// The astronomy above runs on LOCAL APPARENT SOLAR TIME, where noon is the moment
+// the sun crosses the meridian. Wall clocks differ from that for two reasons, and
+// both are corrected here:
+//
+//   1. LONGITUDE. A time zone keeps one time across a band of longitudes, but the
+//      sun does not: every degree east of the zone's standard meridian brings solar
+//      noon 4 minutes earlier.
+//   2. THE EQUATION OF TIME. Earth's orbit is elliptical and its axis is tilted, so
+//      true solar noon drifts against a uniform clock by roughly -14..+16 minutes
+//      over the year.
+//
+// The zone's UTC offset comes from the browser's own Intl data, so the app carries no
+// time-zone database and stays fully offline. Because that offset is read FOR THE
+// SELECTED DAY, daylight saving is handled correctly without special-casing.
+// ---------------------------------------------------------------------------
+
+/**
+ * The EQUATION OF TIME in MINUTES for a day of the year: true solar time minus mean
+ * solar time. Positive means the sun is AHEAD of the clock. Standard engineering
+ * approximation (accurate to well under a minute), matching this module's hand-written,
+ * dependency-free approach.
+ */
+export function equationOfTime(dayOfYear: number): number {
+  const b = ((2 * Math.PI) / 365) * (dayOfYear - 81);
+  return 9.87 * Math.sin(2 * b) - 7.53 * Math.cos(b) - 1.5 * Math.sin(b);
+}
+
+/**
+ * The site's UTC offset in HOURS for a given day, read from the browser's Intl
+ * time-zone data (so no tz database ships with the app). Because the offset is
+ * resolved for the selected DAY, daylight saving is applied exactly when the zone
+ * actually observes it.
+ *
+ * Returns 0 (UTC) for an unrecognised zone rather than throwing, so a corrupt or
+ * hand-edited saved project degrades to a readable time instead of breaking the study.
+ */
+export function utcOffsetHours(timeZone: string, dayOfYear: number, year?: number): number {
+  const y = year ?? new Date().getUTCFullYear();
+  // Midday UTC on the selected day — far from any DST transition boundary.
+  const at = new Date(Date.UTC(y, 0, dayOfYear, 12, 0, 0));
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).formatToParts(at);
+
+    const get = (type: string): number => {
+      const p = parts.find((x) => x.type === type);
+      return p ? Number(p.value) : 0;
+    };
+    // Re-read the zone's local wall time AS IF it were UTC; the difference from the
+    // real instant is the offset. (hour can format as 24 for midnight — fold it.)
+    const asUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour") % 24, get("minute"), get("second"));
+    return (asUtc - at.getTime()) / 3_600_000;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Minutes to ADD to wall-clock time to get local apparent solar time, for a site at
+ * `longitude` in `timeZone` on `dayOfYear`. See the section note above for the two
+ * terms: the offset from the zone's standard meridian, plus the equation of time.
+ */
+export function timeCorrectionMinutes(longitude: number, timeZone: string, dayOfYear: number): number {
+  // The zone's standard meridian: 15 degrees of longitude per hour of UTC offset.
+  const standardMeridian = 15 * utcOffsetHours(timeZone, dayOfYear);
+  return 4 * (longitude - standardMeridian) + equationOfTime(dayOfYear);
+}
+
+/** Convert local apparent SOLAR time (decimal hours) to wall-CLOCK time. */
+export function solarToClock(solarHour: number, longitude: number, timeZone: string, dayOfYear: number): number {
+  return solarHour - timeCorrectionMinutes(longitude, timeZone, dayOfYear) / 60;
+}
+
+/** Convert wall-CLOCK time (decimal hours) to local apparent SOLAR time. */
+export function clockToSolar(clockHour: number, longitude: number, timeZone: string, dayOfYear: number): number {
+  return clockHour + timeCorrectionMinutes(longitude, timeZone, dayOfYear) / 60;
+}
+
+/**
+ * Short zone label for the selected day (e.g. "CST", "CDT", "GMT+2") so a clock-time
+ * readout says WHICH clock it means. Falls back to the raw zone name if the browser
+ * cannot abbreviate it.
+ */
+export function timeZoneAbbrev(timeZone: string, dayOfYear: number, year?: number): string {
+  const y = year ?? new Date().getUTCFullYear();
+  const at = new Date(Date.UTC(y, 0, dayOfYear, 12, 0, 0));
+  try {
+    const part = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "short" })
+      .formatToParts(at)
+      .find((p) => p.type === "timeZoneName");
+    return part ? part.value : timeZone;
+  } catch {
+    return timeZone;
+  }
 }
 
 /** Format a decimal solar hour as "HH:MM" (24-hour). */

@@ -141,8 +141,29 @@ export function lerpViewport(
 }
 
 /**
+ * Screen-space edges of the canvas that are COVERED by something drawn over it — the
+ * floating panels, a tool bar — and so cannot be used to display content.
+ *
+ * The canvas spans the whole window and the panels float ON TOP of it, which means its
+ * pixel size is not its VISIBLE size. Fitting to the full width therefore frames content
+ * so that its left and right ends sit underneath the panels: the fit is arithmetically
+ * correct and visually wrong. These insets describe the region actually in view.
+ */
+export interface FitInsets {
+  left?: number;
+  right?: number;
+  top?: number;
+  bottom?: number;
+}
+
+/**
  * Compute a viewport that FITS a perimeter's bounds into a `width`×`height`
  * canvas, leaving `marginPx` of padding on every side, and centres it.
+ *
+ * `insets` narrows the target to the VISIBLE region (see {@link FitInsets}). The content is
+ * scaled to that region and centred ON IT — not on the canvas — so an asymmetric layout
+ * (a wide panel one side, a narrow one the other) still frames content in the middle of
+ * what the user can see. Defaults to zero on every edge, i.e. the whole canvas.
  *
  * `minScale` is the lowest px/unit the fit may zoom OUT to; it defaults to the
  * interactive MIN_SCALE (0.25) so the main canvas's fits behave as before. The
@@ -168,10 +189,24 @@ export function fitViewport(
   height: number,
   marginPx: number,
   minScale: number = MIN_SCALE,
+  fillFactor: number = 1,
+  insets: FitInsets = {},
 ): Viewport {
+  // The visible region: the canvas minus whatever covers its edges. Floored at 1px so a
+  // window narrower than its own panels still produces a finite scale rather than NaN.
+  const insetL = Math.max(0, insets.left ?? 0);
+  const insetR = Math.max(0, insets.right ?? 0);
+  const insetT = Math.max(0, insets.top ?? 0);
+  const insetB = Math.max(0, insets.bottom ?? 0);
+  const regionW = Math.max(width - insetL - insetR, 1);
+  const regionH = Math.max(height - insetT - insetB, 1);
+  // Centre of the VISIBLE region in screen px — the point content is framed around.
+  const centreX = insetL + regionW / 2;
+  const centreY = insetT + regionH / 2;
+
   const pts = flattenPerimeter(p);
   if (pts.length === 0) {
-    return { scale: 30, originX: width / 2, originY: height / 2 };
+    return { scale: 30, originX: centreX, originY: centreY };
   }
 
   let minX = Infinity;
@@ -191,24 +226,34 @@ export function fitViewport(
   const spanX = Math.max(maxX - minX, EPS);
   const spanY = Math.max(maxY - minY, EPS);
 
-  // Usable drawing area after margins (kept positive even for tiny windows).
-  const availW = Math.max(width - marginPx * 2, 1);
-  const availH = Math.max(height - marginPx * 2, 1);
+  // Usable drawing area: the visible region, less the margin on each side (kept positive
+  // even for tiny windows).
+  const availW = Math.max(regionW - marginPx * 2, 1);
+  const availH = Math.max(regionH - marginPx * 2, 1);
 
   // Fit: choose the scale that lets BOTH spans fit, then clamp. `minScale`
   // defaults to the interactive MIN_SCALE (so the MAIN canvas's fits are
   // unchanged); callers framing a LARGE extent into a TINY box (the OverviewMap)
   // pass a lower floor so a wide many-panel strip / huge footprint can shrink
   // enough to frame in full instead of overflowing the box at the 0.25 floor.
-  const scale = Math.max(minScale, Math.min(MAX_SCALE, Math.min(availW / spanX, availH / spanY)));
+  //
+  // `fillFactor` (default 1 = fill the margin box exactly) scales the fit DOWN when
+  // < 1 so the framed content sits with extra breathing room instead of pressing the
+  // margins — used by the wall-border zoom so clicking a panel doesn't slam in too
+  // tight. Applied to the fit target BEFORE the clamp so it still respects min/max.
+  const scale = Math.max(
+    minScale,
+    Math.min(MAX_SCALE, Math.min(availW / spanX, availH / spanY) * fillFactor),
+  );
 
-  // Centre the bounds' midpoint in the canvas. Model +Y is up, so the screen
-  // origin Y must account for the flip via toScreen's subtraction.
+  // Centre the bounds' midpoint on the VISIBLE region's centre (the whole canvas when no
+  // insets are given). Model +Y is up, so the screen origin Y must account for the flip
+  // via toScreen's subtraction.
   const midX = (minX + maxX) / 2;
   const midY = (minY + maxY) / 2;
   return {
     scale,
-    originX: width / 2 - midX * scale,
-    originY: height / 2 + midY * scale,
+    originX: centreX - midX * scale,
+    originY: centreY + midY * scale,
   };
 }

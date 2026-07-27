@@ -21,9 +21,6 @@ import {
   hitVertex,
   hitSegment,
   hitHandle,
-  flattenPerimeter,
-  perimeterLength,
-  enclosedArea,
   type Perimeter,
   type Point,
 } from "./core/geometry";
@@ -39,21 +36,17 @@ import {
   makeSegmentArc,
   clearVertexHandles,
 } from "./core/perimeterOps";
-import { defaultViewport, toScreen, toModel, pixelsToModel, zoomAt, pan, fitViewport, easeOut, lerpViewport, type Viewport } from "./core/viewport";
+import { defaultViewport, toScreen, toModel, pixelsToModel, zoomAt, pan, fitViewport, easeOut, lerpViewport, type Viewport, type FitInsets } from "./core/viewport";
 import { render, type RenderState, type UnravelDraw } from "./core/renderer";
 import { unravelPerimeter, unravelBoundsPerimeter, buildEqualColumns, buildEqualRows, type UnravelSegment } from "./core/unravel";
+import { buildUnrollChain, renderUnrollFrame, unrollDurationMs, type UnrollFrame } from "./core/unrollAnim";
 import { DEFAULT_WALL_HEIGHT_FT } from "./core/extrude3d";
 import {
   fmtLength,
-  fmtArea,
   fmtLengthTick,
   toDisplayLength,
   fromDisplayLength,
-  lengthAbbr,
-  getUnitSystem,
   setUnitSystem,
-  persistUnitSystem,
-  type UnitSystem,
 } from "./core/units";
 import {
   loadSaved,
@@ -64,6 +57,7 @@ import {
   clonePerimeter,
   canSave,
   emptyLocation,
+  defaultLocation,
   cloneLocation,
   cloneCellFraming,
   cloneCellTypes,
@@ -73,24 +67,153 @@ import {
   type CellInsets,
 } from "./core/savedPerimeters";
 import {
+  TOUR_STEPS,
+  DEMO_PERIMETER,
+  DEMO_PROJECT_NAME,
+  DEMO_ADDRESS,
+  DEMO_WALL_HEIGHT_FT,
+  DEMO_FLOOR_TO_FLOOR_FT,
+  DEMO_SPANDREL_BAND_FT,
+  DEMO_MODULE_FT,
+  DEMO_MULLION_OFFSET_FT,
+  DEMO_FOCUS_EDGE,
+  DEMO_VIEW_MODE_SEQUENCE,
+  DEMO_EXPORT_PANEL_COUNT,
+  DEMO_MARQUEE_PAD_FT,
+  demoExportWindow,
+  demoCellType,
+  demoColumnOffsets,
+  demoDrawFrame,
+  demoFloorLevels,
+  demoRowOffsets,
+} from "./core/demoTour";
+import DemoTour from "./DemoTour";
+import {
   cloneSolarSettings,
   defaultSolarSettings,
   sunPosition,
   wallIncidenceCos,
   type SolarSettings,
 } from "./core/solar";
-import { buildRadiationMatrix } from "./core/radiation";
-import RadiationDiagram from "./RadiationDiagram";
-import InsolationChart from "./InsolationChart";
+import { resolveSite, formatPlace, canonicalAddress, type Place } from "./core/gazetteer";
+import {
+  decodeImageFile,
+  placeInView,
+  cloneReferenceImages,
+  hitImageBody,
+  handlePoint as imageHandlePoint,
+  resizeImage,
+  handleCursor,
+  HANDLE_KEYS,
+  ACCEPTED_IMAGE_TYPES,
+  type ReferenceImage,
+  type HandleKey,
+} from "./core/referenceImage";
 import MiniWindow from "./MiniWindow";
 import ExportPopup from "./ExportPopup";
-import OverviewMap from "./OverviewMap";
-import Settings from "./Settings";
+import {
+  AssignIcon,
+  CenterlinesIcon,
+  CwTypeIcon,
+  ElevationsIcon,
+  EraseIcon,
+  FloorLinesIcon,
+  FramingIcon,
+  PanIcon,
+  PenIcon,
+  PlanIcon,
+  SelectIcon,
+} from "./icons";
+import StatisticsPanel from "./StatisticsPanel";
+import {
+  perimeterBounds,
+  boundsHandlePoint,
+  translatePerimeter,
+  scalePerimeter,
+  hitPerimeterBody,
+  type Bounds,
+} from "./core/perimeterTransform";
+import { ControlsList, ViewModesInfo, StatisticsInfo, HELP_PANEL_TITLE, type HelpPanel } from "./HelpPanels";
+import { buildCostEstimate, type PanelCostInput } from "./core/cost";
+import {
+  CW_TYPE_LABELS,
+  CELL_TYPE_LABELS,
+  CELL_TYPE_VLT,
+  CELL_VIEW_MODES,
+  CELL_VIEW_LABELS,
+  type CwType,
+  type CellType,
+  type CellViewMode,
+  STATS_MODES,
+  isPerPanelStat,
+  type StatsMode,
+} from "./core/displayModes";
+
+/**
+ * Which way the CENTERLINES tool should split, decided by where the cursor sits INSIDE
+ * the panel. This replaces the old Shift modifier: the same pointer position that
+ * already chooses the SPACING now also chooses the DIRECTION, so the whole tool is one
+ * continuous gesture with nothing to hold down.
+ *
+ * THE RULE — the panel's two DIAGONALS cut it into four triangles, and the lines you
+ * get run PARALLEL TO THE NEAREST EDGE:
+ *
+ *        +-----------------+
+ *        | \     rows    / |     LEFT + RIGHT triangles -> VERTICAL centerlines
+ *        |   \         /   |                              (equal-width COLUMNS)
+ *        | cols \   / cols |     TOP + BOTTOM triangles -> HORIZONTAL centerlines
+ *        |       X         |                              (equal-height ROWS)
+ *        |   /         \   |
+ *        | /     rows    \ |
+ *        +-----------------+
+ *
+ * WHY this way round, and not the reverse: the COUNT is driven by the cursor's X for
+ * columns and its Y for rows, so the axis the user sweeps ALONG has to be the axis that
+ * gets subdivided — otherwise the drag would select a split whose spacing does not
+ * respond to the movement making it. Sweeping across the middle of a wall widens and
+ * narrows COLUMNS; running up its left or right end does the same for ROWS. Reversing
+ * the mapping puts a horizontal sweep in the rows region, where moving sideways changes
+ * nothing — the gesture goes dead.
+ *
+ * Normalising each offset by the panel's own half-extent makes it ASPECT-AWARE, which
+ * is what lands the common case: a wall elevation is far wider than it is tall, so the
+ * left/right triangles cover most of its area and a cursor almost anywhere means
+ * COLUMNS — with ROWS a short move toward the top or bottom edge away. A tall narrow
+ * panel inverts that and favours rows. A raw distance-to-nearest-edge test in feet would
+ * instead answer "rows" nearly everywhere on a wide panel, since its top and bottom are
+ * genuinely closer to most points than its ends are.
+ */
+function divideAxisAt(p: Point, lo: number, hi: number, panelH: number): "v" | "h" {
+  const halfW = (hi - lo) / 2;
+  const halfH = panelH / 2;
+  // Degenerate panel: no meaningful diagonals, so keep the historical default.
+  if (halfW <= 1e-9 || halfH <= 1e-9) return "v";
+  const u = (p.x - (lo + halfW)) / halfW; // -1 at the left edge, +1 at the right
+  const v = (p.y - halfH) / halfH; //        -1 at the baseline, +1 at the top
+  // Ties (exactly on a diagonal) fall to columns — the more common split.
+  return Math.abs(u) >= Math.abs(v) ? "v" : "h";
+}
 
 /** Pixel tolerance for hit-testing vertices/segments. */
 const HIT_TOLERANCE_PX = 9;
 /** Pixel tolerance for "click the first vertex to close". */
 const CLOSE_TOLERANCE_PX = 12;
+/**
+ * Compact identity for a reference-image list: everything the user can CHANGE, and
+ * nothing they cannot. Used by the auto-save no-op guard in place of JSON.stringify,
+ * which would otherwise serialise every image's data URL on every render. `src` is
+ * immutable for a given id, so omitting it loses no information.
+ */
+function imageSignature(list: ReferenceImage[]): string {
+  return list.map((i) => `${i.id}:${i.x}:${i.y}:${i.w}:${i.h}:${i.opacity}:${i.locked}`).join("|");
+}
+
+/**
+ * Pixel half-size of a reference image's resize-grip HIT area. Larger than the grip's
+ * drawn half-size (--ref-image-handle-size) so the target is comfortable without
+ * making the drawn square heavier — the usual "hit area bigger than the paint" rule.
+ */
+const IMAGE_HANDLE_HIT_PX = 7;
 /** Pointer travel (px) before a press-drag counts as a handle pull rather than a click. */
 const DRAG_THRESHOLD_PX = 4;
 /**
@@ -103,66 +226,40 @@ const DRAG_THRESHOLD_PX = 4;
  */
 const DRILL_COOLDOWN_MS = 300;
 
-/** Curtain-wall fabrication systems selectable from the "CW Type" button, with the
- *  labels shown to the user (the button relabels to "CW Type: <name>" once chosen). */
-type CwType = "stick" | "unitized";
-const CW_TYPE_LABELS: Record<CwType, string> = {
-  stick: "Stick System",
-  unitized: "Unitized System",
-};
-
-/** Glazing/infill TYPES selectable from the "Type" button's submenu, with the labels
- *  shown to the user. Assigned per grid CELL (Cells tab) and rendered with a per-type
- *  hatch. The order here is the order the submenu lists them. */
-type CellType = "vision" | "spandrel" | "opaque";
-const CELL_TYPE_LABELS: Record<CellType, string> = {
-  vision: "Vision",
-  spandrel: "Spandrel",
-  opaque: "Opaque",
-};
+/**
+ * The saved-project id the GUIDED DEMO always writes to. Fixed rather than generated so
+ * re-running the demo overwrites its own entry instead of stacking copies in the user's
+ * library, and so stepping Back across the save is a no-op rather than a duplicate.
+ */
+const DEMO_SAVED_ID = "oligo-demo-tour";
 
 /**
- * Representative VISIBLE LIGHT TRANSMITTANCE (VLT / NFRC visible transmittance, 0–1) per
- * cell type — industry-typical defaults, used by the VLT statistics view. Vision = a clear /
- * low-E vision IGU (~0.70 VT, the see-through glazing that admits daylight); Spandrel
- * (back-painted / opacified glass that conceals the slab edge) and Opaque (solid infill —
- * metal panel, masonry, etc.) transmit no visible light, so 0. Adjust here to match a
- * specific product's spec sheet — these are the single source of truth for the VLT readout.
+ * sessionStorage key recording that the Demo button has been used this visit, which stops
+ * its first-run pulse. Session-scoped on purpose — see `demoSeen`.
  */
-const CELL_TYPE_VLT: Record<CellType, number> = {
-  vision: 0.7,
-  spandrel: 0,
-  opaque: 0,
-};
+const DEMO_SEEN_KEY = "oligo.demoSeen.v1";
+
+
+
 
 /**
- * CELL VIEW MODES — the display modes the "View" button's dropdown menu lists. "normal"
- * is the default presentation; "materialId" colours every grid cell by its geometric
- * shape (a Lumion-style Material ID overlay). The menu lists them in this array order, so
- * adding a future mode here automatically adds a menu entry.
+ * A stable POSITION identity for a grid cell within its panel — `edge` plus the cell's
+ * four model-space bounds (rounded to defeat float jitter). Used by the cell PAINT drag
+ * to dedupe cells already swept, so re-entering a cell mid-drag doesn't re-add it. This
+ * is a POSITION key (one specific cell), distinct from `cellShapeColors.keyOf` which is a
+ * SHAPE/Material-ID key (every same-size cell shares it).
  */
-const CELL_VIEW_MODES = ["normal", "materialId", "orientation", "clean", "shadows"] as const;
-type CellViewMode = (typeof CELL_VIEW_MODES)[number];
-/** Human label for each cell-view mode (shown on the View button + its menu). */
-const CELL_VIEW_LABELS: Record<CellViewMode, string> = {
-  normal: "Technical",
-  materialId: "Material ID",
-  orientation: "Orientation Heatmap",
-  clean: "Clean",
-  shadows: "Shadows",
-};
+function cellPosKey(
+  edge: number,
+  c: { x0: number; x1: number; y0: number; y1: number },
+): string {
+  return `${edge}|${c.x0.toFixed(4)}|${c.y0.toFixed(4)}|${c.x1.toFixed(4)}|${c.y1.toFixed(4)}`;
+}
 
-/**
- * The "?" help button opens a submenu that picks ONE of three reference panels. Each
- * panel reuses the same floating-popup chrome; only its title + body differ.
- */
-type HelpPanel = "controls" | "stats" | "views";
-/** Title shown (UPPERCASED by CSS) at the top-left of each help reference panel. */
-const HELP_PANEL_TITLE: Record<HelpPanel, string> = {
-  controls: "Control List",
-  stats: "Statistics Info",
-  views: "View Modes Info",
-};
+/* (The SHORT view-mode labels were dropped with the two-column grid: the picker that
+   replaced it is full width, so every mode shows its full name.) */
+
+
 
 /** 8-point compass labels, indexed by round(bearing / 45) — N at 0°, clockwise. */
 const CARDINALS_8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"] as const;
@@ -248,6 +345,14 @@ type Mode = "draw" | "edit";
 /** Curve type for newly drawn segments. */
 type CurveType = "line" | "arc";
 
+/**
+ * Floor on the height handed to a floating window that STACKS under another one
+ * (see `useStackedBelow`). If the window above has grown tall enough to leave less
+ * than this, the one below overhangs the stage rather than shrinking to a sliver:
+ * a title bar and a row or two of content is the least that is still worth showing.
+ */
+const MIN_STACKED_WIN_HEIGHT = 160;
+
 /** Maximum number of undo steps retained. */
 const HISTORY_LIMIT = 100;
 /**
@@ -263,11 +368,14 @@ interface DocSnapshot {
   unravelCells: Record<number, number>;
   /** Per-edge-index vertical division-line offsets (Subtractive tool). Replaced, never mutated. */
   panelDivisions: Record<number, number[]>;
-  /** Per-edge-index HORIZONTAL divider offsets (Subtractive + Shift). Replaced, never mutated. */
+  /** Per-edge-index HORIZONTAL divider offsets (Centerlines, row split). Replaced, never mutated. */
   panelDividersH: Record<number, number[]>;
   /** Per-edge vertical / horizontal mullion half-width offsets (Mullions tool). */
   panelMullionsV: Record<number, number>;
   panelMullionsH: Record<number, number>;
+  /** Imported PDF/PNG/JPEG underlays placed in model space. In the snapshot so that
+   *  moving, resizing, importing, and deleting one all undo like any other edit. */
+  referenceImages: ReferenceImage[];
   /** Per-edge UNITIZED per-cell framing insets (Framing tool, Unitized system).
    *  panel edge → cell index → the four edge insets. Replaced, never mutated. */
   panelCellFraming: Record<number, Record<number, CellInsets>>;
@@ -282,37 +390,55 @@ interface DocSnapshot {
 }
 
 /**
- * Eye / eye-off visibility toggle embedded in the RIGHT edge of a tool button's
- * rectangle (Floor Lines · Centerlines · Framing). Rendered as a sibling that overlays
- * the button's right portion (the host wrapper is position:relative), so clicking it
- * toggles only the corresponding element's on-canvas visibility — never the button's
- * main action. `disabled` mirrors the parent button so the icon greys out in lockstep.
+ * One row of the left panel's Display ▸ Visibility list: an eye / eye-off icon plus the
+ * element's name, the whole row clickable. Shows or hides that element on the canvas
+ * WITHOUT deleting it — a view preference, never document state, so it is not undoable.
+ *
+ * These used to be eye icons embedded in the right edge of the Floor Lines / Centerlines
+ * / Framing / Glazing / Dim tool buttons, which made one control mean two things ("arm
+ * this tool" AND "show this element"). Splitting them out is the layers-panel pattern
+ * from Rhino / Revit: tools edit, this list controls what's drawn. `disabled` gates a row
+ * whose element can't exist yet (e.g. outside the elevation views).
  */
-function VisToggle({
+function VisRow({
+  label,
+  full,
   visible,
   disabled,
   onToggle,
-  label,
 }: {
+  /** Short label shown in the two-column grid. */
+  label: string;
+  /** Full name for the tooltip — the grid clips long labels, so this is where the
+   *  unabbreviated name lives ("Floors" → "floor lines"). Defaults to `label`. */
+  full?: string;
   visible: boolean;
   disabled: boolean;
   onToggle: () => void;
-  label: string;
 }) {
+  const name = full ?? label;
   return (
     <button
       type="button"
-      className="vis-toggle"
-      // Sibling, not nested — but stop propagation anyway so a click never bubbles to
-      // the cluster's outside-press handlers that dismiss menus.
-      onClick={(e) => {
-        e.stopPropagation();
-        onToggle();
-      }}
+      className={`panel__vis-row ${visible ? "" : "is-hidden"}`}
+      onClick={onToggle}
       disabled={disabled}
-      aria-pressed={!visible}
-      aria-label={`${visible ? "Hide" : "Show"} ${label}`}
-      title={`${visible ? "Hide" : "Show"} ${label}`}
+      // Checked = currently SHOWN, so screen readers read the row's state the same way the
+      // eye icon reads visually.
+      //
+      // `switch` rather than `aria-pressed`, matching the Statistics chips: the app now
+      // draws one line between the two. An independent ON/OFF SETTING that takes effect
+      // immediately is a switch (these rows, the reading chips); a button that ARMS a tool
+      // — where "pressed" means "this owns the next click" — keeps aria-pressed (Pan,
+      // Select, Delete, Pen, the cluster). These two lists are the same control in the same
+      // kind of window and were announcing themselves differently.
+      role="switch"
+      aria-checked={visible}
+      title={
+        disabled
+          ? `${name} — nothing to show in this view yet`
+          : `${visible ? "Hide" : "Show"} ${name.toLowerCase()} on the canvas`
+      }
     >
       {visible ? (
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -325,6 +451,7 @@ function VisToggle({
           <line x1="1" y1="1" x2="23" y2="23" />
         </svg>
       )}
+      <span className="panel__vis-label">{label}</span>
     </button>
   );
 }
@@ -351,6 +478,33 @@ export default function PolylineTool() {
   viewportRef.current = viewport;
   // requestAnimationFrame id for an in-flight viewport tween (null = none).
   const animRef = useRef<number | null>(null);
+
+  // --- UNROLL TRANSITION (3D massing unrolling into the elevations strip) ---
+  // Declared up here (with the other refs) because the pointer / wheel / keyboard
+  // handlers below all SKIP a running transition, and they are defined long before
+  // the transition's own start/finish callbacks are.
+  //
+  // `unrollFrameRef` non-null == the transition owns the canvas: paint() draws the
+  // animated massing instead of the 2D scene, and every input skips to the end via
+  // `skipUnrollRef` (assigned once finishUnroll exists). Frame state lives in a REF,
+  // not React state, so 60fps of `t` never re-renders the component tree.
+  const unrollFrameRef = useRef<UnrollFrame | null>(null);
+  const unrollRafRef = useRef<number | null>(null);
+  const skipUnrollRef = useRef<() => void>(() => {});
+  /**
+   * Which way the transition is currently running: "unroll" drives t 0 -> 1 and ends in
+   * the elevation views; "fold" drives t 1 -> 0 and ends on the footprint. The same
+   * frame and the same tween serve both — only the direction and the finisher differ —
+   * so folding back is the unrolling played in reverse, not a second animation.
+   */
+  const unrollDirRef = useRef<"unroll" | "fold">("unroll");
+  /**
+   * Published handle to the Unroll Geometry / Fold to Plan toggle, for the keyboard
+   * handler defined ABOVE where that callback can be built (it needs `startUnroll`,
+   * which needs the unravel layout). Same pattern as `skipUnrollRef`; assigned once
+   * the callback exists.
+   */
+  const toggleUnrollViewRef = useRef<() => void>(() => {});
 
   /** Cancel any in-flight viewport animation (e.g. when the user takes over). */
   const cancelAnim = useCallback(() => {
@@ -395,6 +549,7 @@ export default function PolylineTool() {
 
   // Stop any running tween if the component unmounts mid-animation.
   useEffect(() => () => cancelAnim(), [cancelAnim]);
+
 
   // --- TOOL / PRECISION SETTINGS ---
   const [mode, setMode] = useState<Mode>("draw");
@@ -445,17 +600,17 @@ export default function PolylineTool() {
   // Subtractive tool writes EQUAL-COLUMN splits here, but the store itself is just
   // arbitrary offsets (so divisions can accumulate across multiple splits).
   const [panelDivisions, setPanelDivisions] = useState<Record<number, number[]>>({});
-  // PER-PANEL HORIZONTAL dividers placed by the Subtractive tool while Shift is held,
+  // PER-PANEL HORIZONTAL dividers placed by the Centerlines tool when the cursor picks the
   // keyed by ORIGINAL edge index. Each value is a list of OFFSETS in model units from
   // the panel's BASELINE (y = 0). The horizontal mirror of `panelDivisions`: instead of
   // splitting a panel into equal-width columns, these split it into equal-height rows.
   const [panelDividersH, setPanelDividersH] = useState<Record<number, number[]>>({});
   // Subtractive tool armed? Enabled only with a panel selected (focusedPanel). While
   // on, hovering the selected panel recommends an equal-column split (or equal-row
-  // split while Shift is held); click places it. Esc / re-click / deselect disarms it.
+  // split, chosen by cursor position); click places it. Esc / re-click / deselect disarms it.
   const [subtractiveOn, setSubtractiveOn] = useState(false);
   // Subtractive HOVER PREVIEW: the raw cursor model point inside the selected panel
-  // before a press, or null. The render builder picks the split AXIS by `shiftHeld`
+  // before a press, or null. The render builder picks the split AXIS by `divideAxisAt`
   // (vertical columns from .x, horizontal rows from .y). During a drag the array
   // preview lives in `divideDraft` instead.
   const [divideHover, setDivideHover] = useState<Point | null>(null);
@@ -463,6 +618,32 @@ export default function PolylineTool() {
   // edge, the split AXIS ("v" = vertical columns, model-x; "h" = horizontal rows,
   // model-y), and the line positions for that axis. null when not dragging.
   const [divideDraft, setDivideDraft] = useState<{ edge: number; axis: "v" | "h"; lines: number[] } | null>(null);
+  // SELECT tool armed (the Select button, first in the bar)? The OBJECT-selection tool —
+  // the arrow/pointer every design app opens with. While on, a left click picks a
+  // REFERENCE IMAGE (imported underlay) and its grips resize it; perimeter vertices are
+  // deliberately inert here, because vertex editing belongs to Edit. Keeping the two
+  // apart is what lets a click be unambiguous: Select acts on objects, Edit acts on the
+  // shape. Mutually exclusive with the other armed tools.
+  const [selectMode, setSelectMode] = useState(false);
+  // WHOLE-SHAPE SELECTION (Select tool, Plan phase). The drawn perimeter can be picked as
+  // ONE object and moved or scaled by its frame — the same gesture set as a reference
+  // underlay, so the tool means one thing regardless of what it is pointed at. Distinct
+  // from `selectedVertex`, which is Edit's per-point selection.
+  const [perimeterSelected, setPerimeterSelected] = useState(false);
+  /** Grip of the whole-shape frame under the cursor, for the hover highlight + cursor. */
+  const [hoveredPerimeterHandle, setHoveredPerimeterHandle] = useState<HandleKey | null>(null);
+  // PAN tool armed (the Pan button)? While on, a LEFT click-drag on the canvas moves the
+  // VIEW instead of running whatever tool would otherwise own the click — the same drag
+  // the middle / right mouse buttons already do, made available to a plain left drag for
+  // trackpad users. Works in every view/tab and takes precedence over all other tools.
+  const [panMode, setPanMode] = useState(false);
+  // SPACEBAR held? The industry-standard TEMPORARY pan modifier (Rhino / Illustrator /
+  // Figma): hold Space to pan with a left drag, release to fall straight back to the tool
+  // that was armed before — no toggling, no state to remember.
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  // Pan is live when the button is armed OR Space is held. Read by the pointer handlers
+  // (left-drag = pan) and by the canvas cursor (grab / grabbing).
+  const panArmed = panMode || spaceHeld;
   // Eraser tool armed? The DESTRUCTIVE counterpart to Subtractive: deletes division
   // lines on the focused panel AND floor plates (global — no panel required). Enabled
   // whenever the unravel view is open. While on, hovering near any erasable line
@@ -490,15 +671,13 @@ export default function PolylineTool() {
   // pointer-up. Empty when not dragging.
   const [eraseEdgeCollected, setEraseEdgeCollected] = useState<number[]>([]);
   // CELL VIEW MODE — a purely VISUAL display mode for the elevation/Panels view
-  // (the "View" button, top-left next to Statistics). "normal" is the default look; "materialId"
+  // (the "View" button, top-center row next to Statistics). "normal" is the default look; "materialId"
   // tints every grid CELL by its geometric SHAPE (width × height) in a unique colour
   // — like Lumion's Material ID — so identical cells across the whole project read in
   // the same colour at a glance. Not a tool (it arms nothing, mutates no document
   // state) and not persisted: it is an ephemeral way of LOOKING at the model. The
   // "View" button opens a dropdown menu listing the CELL_VIEW_MODES to pick from.
   const [cellViewMode, setCellViewMode] = useState<CellViewMode>("normal");
-  // Is the "View" display-mode dropdown menu open?
-  const [viewMenuOpen, setViewMenuOpen] = useState(false);
   // CURTAIN-WALL TYPE — assigned PER PANEL (edge index → system). Each panel carries at
   // most ONE system (Stick or Unitized); the "CW Type" menu sets it for the focused
   // panel. Switching a panel's type clears that panel's framing of the OTHER system
@@ -510,24 +689,31 @@ export default function PolylineTool() {
   // MULLIONS tool armed? Only available once a CW Type is chosen. Mutually exclusive
   // with the rest of the bottom-left cluster.
   const [mullionsOn, setMullionsOn] = useState(false);
-  // TYPE submenu open? The "Type" button opens a small Vision / Spandrel / Opaque chooser
-  // (drop-up, same rules as the CW Type menu): the button turns blue while it's open and is
-  // mutually exclusive with the rest of the bottom-left cluster (arming any other tool, or a
-  // canvas press, closes it). Picking an option assigns the glazing type to the SELECTED cells
-  // (Wall Border phase; see selectedCells). Reusing this single flag keeps the cluster mutual-exclusion
-  // plumbing (disarmClusterTools / Esc / gate-loss) working unchanged.
+  // GLAZING submenu open? The "Glazing" button opens a small None / Vision / Spandrel /
+  // Opaque chooser (drop-up, same rules as the CW Type menu): the button turns blue while
+  // it's open and is mutually exclusive with the rest of the bottom-left cluster (arming any
+  // other tool, or a canvas press, closes it). Picking an option LOADS the brush below — it
+  // does not assign anything by itself. Reusing this single flag keeps the cluster
+  // mutual-exclusion plumbing (disarmClusterTools / Esc / gate-loss) working unchanged.
   const [typeOn, setTypeOn] = useState(false);
-  // Visibility of the per-cell TYPE hatches on the canvas (the Type button's eye icon). A
+  // The GLAZING BRUSH: the type the Glazing tool is currently LOADED with, or null when the
+  // tool is not armed.
+  //
+  // Glazing works like a paint tool, not like a property editor: you pick the material FIRST
+  // (from the submenu), then apply it to cells — click one, or click-drag across a run of
+  // them and release to commit. That ordering is what makes a drag possible at all; with the
+  // old select-then-assign order a drag could only ever build a selection, and every stroke
+  // cost a round trip back to the menu. It also matches how the same job is done in the
+  // tools this audience already uses (a loaded brush, applied by stroke).
+  //
+  // "none" is a real brush value — painting it CLEARS the type (back to untyped / no hatch),
+  // so erasing an assignment is the same gesture as making one, not a separate mode.
+  const [glazingBrush, setGlazingBrush] = useState<CellType | "none" | null>(null);
+  // Visibility of the per-cell TYPE hatches on the canvas (Display ▸ Visibility ▸ Glazing). A
   // view preference (not model data), like the framing / centerline visibility flags. The
   // eye is gated on `hasAnyCellType` (NOT the Type button's `canType`), so it stays usable
   // for showing/hiding hatches whenever any wall border carries a type, selection or not.
   const [typeVisible, setTypeVisible] = useState(true);
-  // RENDER / CONSTRAINT — two SCAFFOLDED top-row buttons (no behaviour yet) that sit
-  // just left of the Projects minimap, in line with the top-left undo/redo cluster.
-  // They toggle blue/white like the other tool buttons and are only clickable outside
-  // the Building Perimeter tab (i.e. in the unravel views, `unravelOn`).
-  const [renderOn, setRenderOn] = useState(false);
-  const [constraintOn, setConstraintOn] = useState(false);
   // --- EXPORT (select walls -> download CAD geometry) ---
   // When armed, a left-drag in the unravel view sweeps a MARQUEE that selects the
   // panels (walls) it intersects; releasing with a non-empty selection opens the
@@ -587,15 +773,23 @@ export default function PolylineTool() {
   // Esc backs out one layer at a time (cell → panel → strip), so this is the deepest
   // navigation level. Always cleared whenever focusedPanel is cleared / view changes.
   const [focusedCell, setFocusedCell] = useState<{ edge: number; x0: number; x1: number; y0: number; y1: number } | null>(null);
-  // WALL BORDER (panels) phase: the set of grid cells the user has SELECTED for glazing-
-  // type assignment, each by its model-space rectangle bounds + owning edge. A plain
-  // left-click on a cell selects just that one (replaces the set); Shift+click selects
-  // every cell sharing that cell's Material ID project-wide. The Type button is enabled
-  // only while this is non-empty, and selectCellType applies the chosen type to all of
-  // them. Transient UI (NOT persisted): cleared on panel switch / view toggle / grid edit.
+  // WALL BORDER (panels) phase: the set of grid cells currently HIGHLIGHTED, each by its
+  // model-space rectangle bounds + owning edge. This carries two related jobs:
+  //   • with NO glazing brush loaded — a plain SELECTION (click one cell, Shift+click for the
+  //     whole Material-ID family), which switches the dimension readout to the picked cells.
+  //   • with a brush loaded — the LIVE PREVIEW of a paint stroke: it fills in as the drag
+  //     sweeps cells, and is cleared on release once the type is actually applied.
+  // Both read the same on canvas (the blue cell tint), which is the point: the highlight
+  // always means "these cells are what the next action acts on".
+  // Transient UI (NOT persisted): cleared on panel switch / view toggle / grid edit.
   const [selectedCells, setSelectedCells] = useState<
     Array<{ edge: number; x0: number; x1: number; y0: number; y1: number }>
   >([]);
+  // PANELS phase only: when true, the focused panel is dimensioned by its OVERALL length +
+  // height instead of the per-column / per-row grid. Turned on by clicking the empty canvas
+  // once nothing is selected (the camera stays put — no zoom-out); reset to the grid when
+  // cells are selected (effect below) or another panel is focused (zoomToPanel). Transient.
+  const [panelDimsOverall, setPanelDimsOverall] = useState(false);
   // PANELS phase only: index (into cellsForEdge(focusedPanel)) of the grid cell the
   // cursor is hovering, or -1 for none. Drives a per-cell highlight so a zoomed-in,
   // subdivided panel visibly reads as a set of individually navigable cells. Stored
@@ -620,23 +814,23 @@ export default function PolylineTool() {
   const [floorPlateMode, setFloorPlateMode] = useState(false);
   // VISIBILITY of the floor lines / centerlines / framing — view preferences (NOT model
   // data, so not persisted): false hides those elements from the elevation view without
-  // deleting them. Each is toggled by the eye icon embedded in its tool button (Floor
+  // deleting them. Each is toggled from the left panel's Display ▸ Visibility list (Floor
   // Lines / Centerlines / Framing).
   const [floorLinesVisible, setFloorLinesVisible] = useState(true);
   const [centerlinesVisible, setCenterlinesVisible] = useState(true);
   const [framingVisible, setFramingVisible] = useState(true);
   // VISIBILITY of the on-canvas DIMENSION text (panel width / per-column-row / cell
   // dimension labels AND the per-panel height input fields) across the Elevations,
-  // Wall Border, and Cells tabs. Toggled ONLY by the Dim button's eye icon (the Dim
+  // Wall Border, and Cells tabs. Toggled ONLY by Display ▸ Visibility ▸ Dimensions (the
   // button itself has no action yet); this is the SINGLE source of truth, so no view
   // (Clean / Shadows) auto-hides dimensions. Visible by default.
   const [dimensionsVisible, setDimensionsVisible] = useState(true);
 
   // --- ONBOARDING HINT ---
-  // A first-run hint centered on the empty canvas ("Draw a perimeter to start or open a
-  // saved project") with an arched arrow toward the Projects panel. It is dismissed the
-  // instant the user interacts with ANYTHING (any pointerdown) and never returns this
-  // session. Only shown while the canvas is genuinely empty (no perimeter drawn yet).
+  // A first-run hint centered on the empty canvas ("Sketch perimeter / or load project").
+  // It is dismissed the instant the user interacts with ANYTHING (any pointerdown) and
+  // never returns this session. Only shown while the canvas is genuinely empty (no
+  // perimeter drawn yet).
   const [hintDismissed, setHintDismissed] = useState(false);
   const showHint = !hintDismissed && !unravelOn && perimeter.vertices.length === 0;
   // Dismiss on the first pointerdown anywhere (canvas, panel, nav, Projects panel…).
@@ -648,12 +842,14 @@ export default function PolylineTool() {
   }, [showHint]);
 
   // --- HELP POPUP ---
-  // The bottom-right "?" button opens a small submenu (helpMenuOpen) ABOVE itself that
+  // The utility bar's "Help" button opens a small submenu (helpMenuOpen) that
   // picks ONE of three reference panels (helpPanel): the control list, the statistics
   // info, or the view-modes info. The submenu and a panel are mutually exclusive
   // (opening one closes the other). `helpOpen` (derived) means "any help UI is showing"
   // — it drives the button's active state and lets the global key handler defer Escape.
-  // Each panel is dismissed by its close button, an outside click, or Escape.
+  // The chooser MENU still closes on an outside click (transient picker), but a chosen
+  // PANEL is a STAY-OPEN reference: it survives canvas navigation and is dismissed only
+  // by its × close button, the Help button, or Escape (so it can annotate on-screen items).
   const [helpMenuOpen, setHelpMenuOpen] = useState(false);
   const [helpPanel, setHelpPanel] = useState<HelpPanel | null>(null);
   const helpOpen = helpMenuOpen || helpPanel !== null;
@@ -662,68 +858,145 @@ export default function PolylineTool() {
     setHelpPanel(null);
   };
 
-  // --- SMART SEARCH ---
-  const [searchQuery, setSearchQuery] = useState("");
-
-  // --- SETTINGS POPUP ---
-  // The gear button at the top-right of the nav header toggles a draggable Settings
-  // popup (same chrome as the Solar Study popup) holding the Units category.
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  // Attention flash: triggered when the user clicks outside the Settings popup.
-  const [settingsFlashing, setSettingsFlashing] = useState(false);
-  const settingsFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const handleSettingsBackdrop = useCallback(() => {
-    if (settingsFlashTimer.current) clearTimeout(settingsFlashTimer.current);
-    setSettingsFlashing(true);
-    settingsFlashTimer.current = setTimeout(() => setSettingsFlashing(false), 400);
+  // UNITS — the app is FEET-ONLY. Geometry has always been stored in feet; the Settings
+  // popup that let the display switch to metric has been removed, so the display unit is
+  // now fixed at imperial. core/units keeps its conversion helpers (fmtLength, parsing,
+  // the renderer's tick labels all still route through them), which is what makes
+  // re-introducing a unit switch a matter of restoring one control rather than
+  // re-plumbing every readout.
+  useEffect(() => {
+    setUnitSystem("imperial");
   }, []);
 
-  // Active DISPLAY unit (feet ↔ metric). Geometry is always stored in feet; this only
-  // controls how lengths/areas are formatted and how typed input is parsed. Seeded from
-  // the module-level value in core/units (already loaded from the persisted preference),
-  // so the first paint matches the saved choice. Mirrored into React state so changing
-  // it re-renders the DOM readouts AND re-runs the canvas paint effect (it's a dep).
-  const [unitSystem, setUnitSystemState] = useState<UnitSystem>(() => getUnitSystem());
-  // Apply a unit choice everywhere: update the module-level value the renderer + all
-  // formatters read, persist it, then bump React state to repaint. No geometry changes.
-  const applyUnitSystem = useCallback((u: UnitSystem) => {
-    setUnitSystem(u);
-    persistUnitSystem(u);
-    setUnitSystemState(u);
+  // --- FLOATING WINDOWS ---
+  // Independent panels, each with its own title bar, laid out in two columns:
+  //   LEFT   Overview -> Display
+  //   RIGHT  (utility bar) -> Statistics -> Selected image
+  //
+  // (Collapse and drag were both removed: the title bars are plain labels now and every
+  // window sits at a fixed anchor.)
+  //
+  // The head of each column anchors by CSS — Overview top-left, Statistics top-right
+  // under the utility bar. The window BELOW gets a measured position instead, because
+  // the height of the one above it is not knowable in CSS.
+  const propsWinRef = useRef<HTMLDivElement>(null);
+  const displayWinRef = useRef<HTMLDivElement>(null);
+  const statsWinRef = useRef<HTMLDivElement>(null);
+  const imageWinRef = useRef<HTMLDivElement>(null);
+
+  /**
+   * Measure `anchorRef`'s bottom edge and report the spot flush beneath it, in stage
+   * coordinates — the position a window stacked under it should take, plus the height
+   * that is actually LEFT below it.
+   *
+   * The height cap matters because the anchor can grow: Statistics now stacks as many
+   * readings as are switched on. Without it a tall anchor pushes the window below off
+   * the bottom of the stage, where it cannot be reached at all. Handing the window the
+   * remaining space instead lets its own body scroll — it always stays on screen.
+   *
+   * A ResizeObserver covers the anchor changing HEIGHT (collapsing, or a section
+   * appearing); it is pointed at the stage as well, so resizing the browser re-measures.
+   * `deps` covers the cases a ResizeObserver cannot see: an anchor that is itself
+   * positioned by an inline `top` moves without resizing, so whatever drives that has to
+   * be listed.
+   */
+  const useStackedBelow = (
+    anchorRef: React.RefObject<HTMLElement>,
+    deps: React.DependencyList,
+  ): React.CSSProperties | undefined => {
+    const [pos, setPos] = useState<{ x: number; y: number; h: number } | null>(null);
+    useLayoutEffect(() => {
+      const win = anchorRef.current;
+      const stage = wrapRef.current;
+      if (!win || !stage) return;
+      const measure = () => {
+        const winRect = win.getBoundingClientRect();
+        const stageRect = stage.getBoundingClientRect();
+        // Gap and margin live in the stylesheet (single source of truth), read back here
+        // because the offset has to be computed in JS from a measured height.
+        const css = getComputedStyle(win);
+        const gap = parseFloat(css.getPropertyValue("--props-stack-gap")) || 8;
+        const margin = parseFloat(css.getPropertyValue("--mini-offset")) || 12;
+        const y = winRect.bottom - stageRect.top + gap;
+        setPos({
+          x: winRect.left - stageRect.left,
+          y,
+          // Floor: an anchor tall enough to leave no room still yields a usable window
+          // (it simply overhangs) rather than one collapsed to its title bar.
+          h: Math.max(MIN_STACKED_WIN_HEIGHT, stageRect.height - y - margin),
+        });
+      };
+      measure();
+      const ro = new ResizeObserver(measure);
+      ro.observe(win);
+      ro.observe(stage);
+      return () => ro.disconnect();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, deps);
+    return pos ? { left: pos.x, top: pos.y, right: "auto", maxHeight: pos.h } : undefined;
+  };
+
+  // DISPLAY stacks under Overview in the LEFT column. Overview's height changes with the
+  // sections that appear as the selection changes, which the ResizeObserver sees on its
+  // own — so, like Selected image, it needs no extra dependency.
+  const displayWinStyle = useStackedBelow(propsWinRef, []);
+  // SELECTED IMAGE stacks under Statistics in the RIGHT column. Statistics is anchored by
+  // CSS, so it only ever moves by changing its own height — which happens every time a
+  // reading is toggled, and which the ResizeObserver sees on its own, leaving no extra
+  // dependency to declare.
+  const imageWinStyle = useStackedBelow(statsWinRef, []);
+
+  /**
+   * Which floating window was touched last, so it draws IN FRONT. Without this they all
+   * share a z-index and DOM order decides which wins where two overlap — arbitrary from
+   * the user's side. Overlap is real: a window that grows (Statistics, as readings are
+   * switched on) can reach the one stacked beneath it, and clicking either should be
+   * enough to bring it forward.
+   */
+  const [frontWin, setFrontWin] = useState<"props" | "display" | "stats" | "image">("props");
+
+  // --- STATISTICS READINGS ---
+  // Every reading switched ON in the Statistics window (top of the right column), as a
+  // SET: the panel stacks all of them, so this is not a one-of-N pick.
+  // "general" = the totals for the drawing; "irradiance" = the Irradiance (W/m²) diagram
+  // (a Ladybug-style month×hour solar heatmap on the selected wall border); "insolation"
+  // = its energy companion, the monthly Insolation (kWh/m²) bar chart for the same wall;
+  // "wwr" = the Window-to-Wall Ratio readout for the selected wall border (Gross Opening +
+  // Net Glazing methods, from the per-cell glazing types); "vlt" = the Visible Light
+  // Transmittance readout for the same wall (per-type industry VLT values + the wall's
+  // effective VLT). Toggled by the chips at the top of the panel — see STATS_MODES for
+  // the full list and each one's phase gate.
+  // Defaults to General: a statistics panel that opens showing nothing teaches nothing,
+  // and General reads in both phases.
+  const [statsModes, setStatsModes] = useState<StatsMode[]>(["general"]);
+  // Which saved project's SOLAR STUDY popup is open (by id), or null. Owned here rather
+  // than inside MiniWindow because the study is launched from TWO places: a project row's
+  // ☀ button and the left panel's Display section. MiniWindow renders the popup.
+  const [solarStudyId, setSolarStudyId] = useState<string | null>(null);
+  /**
+   * Toggle one reading on or off. The Statistics panel shows EVERY selected reading
+   * stacked, so this is a set rather than a one-of-N pick — comparing General against
+   * Irradiance means seeing both at once, not flipping between them.
+   */
+  const toggleStatsMode = useCallback((m: StatsMode) => {
+    setStatsModes((prev) => (prev.includes(m) ? prev.filter((k) => k !== m) : [...prev, m]));
   }, []);
 
-  // --- LEFT TOOL PANEL COLLAPSE ---
-  // Hide the left tool panel (Create / Location) to reclaim horizontal screen space
-  // for the canvas. Toggled from the chevron at the left of the nav header; when
-  // collapsed the panel's grid column shrinks to zero (see .app--panel-collapsed).
-  const [panelCollapsed, setPanelCollapsed] = useState(true);
-
-  // --- STATISTICS DROPDOWN ---
-  // The "Statistics" button (top of canvas, next to Redo) toggles a dropdown that
-  // "none" = hidden; "general" = the general stats overlay; "irradiance" = the
-  // Irradiance (W/m²) diagram (a Ladybug-style month×hour solar heatmap on the selected
-  // wall border); "insolation" = its energy companion, the monthly Insolation (kWh/m²)
-  // bar chart for the same wall; "wwr" = the Window-to-Wall Ratio readout for the selected
-  // wall border (Gross Opening + Net Glazing methods, from the per-cell glazing types).
-  // "vlt" = the Visible Light Transmittance readout for the selected wall border (per-type
-  // industry VLT values + the wall's effective VLT). statsMenuOpen controls the selector
-  // dropdown (None / General / Irradiance / Insolation / WWR / VLT).
-  const [statsMode, setStatsMode] = useState<"none" | "general" | "irradiance" | "insolation" | "wwr" | "vlt">("none");
-  const [statsMenuOpen, setStatsMenuOpen] = useState(false);
-  // The statistics selection is SHARED across views, but only for stats that exist on
-  // BOTH sides. "General" reads in the Building Perimeter and the unravel/elevation
-  // views alike, so it carries over. The solar diagrams (Irradiance / Insolation) are
-  // wall-orientation reads with no footprint meaning, so outside the unravel views the
-  // EFFECTIVE mode collapses to "none" — the Building Perimeter shows nothing for them.
-  // `statsMode` itself is left untouched so the solar pick is restored on return to the
-  // elevations; this derived value drives the button label, the menu active-state, and
-  // the overlay render conditions so all three agree per view.
-  const effectiveStatsMode =
-    !unravelOn &&
-    (statsMode === "irradiance" || statsMode === "insolation" || statsMode === "wwr" || statsMode === "vlt")
-      ? "none"
-      : statsMode;
-
+  /**
+   * The readings that can actually be shown right now. The solar / glazing reads need a
+   * wall orientation and assigned cell types, so they mean nothing on the footprint and
+   * are filtered out in the Plan phase — but they stay in `statsModes`, so switching back
+   * to Elevations restores exactly what was selected rather than making the user re-pick.
+   * Kept in STATS_MODES order so the stack reads the same way every time, regardless of
+   * the order the user happened to click them on.
+   */
+  const activeStatsModes = useMemo(
+    () =>
+      STATS_MODES.filter(({ key, unravelOnly }) => statsModes.includes(key) && (unravelOn || !unravelOnly)).map(
+        ({ key }) => key as StatsMode,
+      ),
+    [statsModes, unravelOn],
+  );
   // --- TRANSIENT INTERACTION STATE ---
   const [cursorModel, setCursorModel] = useState<Point | null>(null);
   // REVIT-STYLE DIMENSION ENTRY (perimeter draw). Once at least one vertex is down,
@@ -766,14 +1039,123 @@ export default function PolylineTool() {
   // Which saved entry (if any) is currently loaded into the editor — used to
   // highlight it in the mini-window and to target the "Update" action.
   const [activeSavedId, setActiveSavedId] = useState<string | null>(null);
+  // The name typed for a sketch that has NOT been saved yet. Once saved, the entry's own
+  // `name` is the single source of truth and this is cleared — the field then edits the
+  // saved project directly (renameSavedEntry), so the panel and the Projects list can
+  // never disagree about what the project is called.
+  const [projectNameDraft, setProjectNameDraft] = useState("");
+
+  // --- REFERENCE IMAGES (imported PDF / PNG / JPEG underlays) ---
+  // Placed in MODEL space beneath the drawing so a site plan or elevation can be traced
+  // over. Part of the document (see DocSnapshot), so every placement, move, resize and
+  // delete is undoable and persists with the project.
+  const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>([]);
+  // Which underlay is selected — the one showing transform grips. null = none.
+  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  // Grip under the pointer, so it can highlight and set the resize cursor.
+  const [hoveredImageHandle, setHoveredImageHandle] = useState<HandleKey | null>(null);
+  // Pointer is over a movable underlay's BODY (Select tool): shows the move cursor, so
+  // it is clear the image can be dragged before the drag starts.
+  const [overImageBody, setOverImageBody] = useState(false);
+  /** Cursor is over the drawn shape while Select is armed — drives the move cursor. */
+  const [overShapeBody, setOverShapeBody] = useState(false);
+  // Transient status for the import itself ("Reading…" / an error). Not persisted.
+  const [importStatus, setImportStatus] = useState<string | null>(null);
+  // Set when a localStorage write fails — with images in play, quota is reachable and
+  // a silent failure would lose work. Surfaced in the on-canvas command bar until the next
+  // successful save.
+  const [saveFailed, setSaveFailed] = useState(false);
+  // The hidden <input type="file"> the Import button drives.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  /**
+   * DECODED bitmaps for the placed underlays, keyed by image id. Kept OUT of React
+   * state: they are derived from `src`, are large, and are only ever read by the
+   * renderer during paint — putting them in state would deep-compare megabytes on
+   * every render for no benefit. A ref plus a repaint tick is the right shape.
+   */
+  const imageBitmapsRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  // Bumped when a bitmap finishes decoding, purely to trigger one repaint.
+  const [bitmapTick, setBitmapTick] = useState(0);
 
   // --- LOCATION (geo-location of the sketch) ---
-  // Free-text address the user types in the LOCATION panel section, plus resolved
-  // coordinates (null until a geocoder — the planned Mapbox integration — fills
-  // them). Defaults BLANK so an untouched sketch carries no geolocation (the blank
-  // canvas is fully supported). Persisted with the saved entry so the address is
-  // remembered and the future map view can reference it without re-typing.
-  const [location, setLocation] = useState<LocationInfo>(emptyLocation);
+  // Free-text address the user types in the LOCATION panel section, plus the site
+  // resolved from it (coordinates, time zone, elevation). Resolution runs against the
+  // BUNDLED offline gazetteer (core/gazetteer.ts) — no API key, no network — and is
+  // committed on Enter / blur rather than per keystroke, so a half-typed address never
+  // yanks the solar study to the wrong city. Defaults to a PRE-RESOLVED Omaha, NE (see
+  // defaultLocation) so the solar tools read a real site from the first click rather than
+  // silently reading nothing. Persisted with the saved entry.
+  const [location, setLocation] = useState<LocationInfo>(defaultLocation);
+  // Outcome of the last resolve attempt, for the readout under the address field.
+  // "missing" = the text matched nothing. Starts RESOLVED because the default location is
+  // already a resolved site — the readout should show its coordinates on first paint, not
+  // wait for the user to re-commit a field that is already correct.
+  const [geoStatus, setGeoStatus] = useState<"idle" | "resolving" | "resolved" | "missing">("resolved");
+  // Runner-up readings for an ambiguous name (the several Springfields), offered as
+  // one-click corrections so a wrong guess is visible and fixable rather than silent.
+  const [geoAlternatives, setGeoAlternatives] = useState<Place[]>([]);
+  // Guards against an out-of-order resolve landing after a newer one (the dataset
+  // import makes the first call slower than the rest).
+  const geoSeqRef = useRef(0);
+
+  /**
+   * Commit the typed address: resolve it offline and write the site onto `location`.
+   * Blank text clears the geolocation entirely (back to "no location"), which is the
+   * documented way to remove a site.
+   */
+  const commitAddress = useCallback(
+    async (text: string) => {
+      const seq = ++geoSeqRef.current;
+      if (text.trim() === "") {
+        setGeoStatus("idle");
+        setGeoAlternatives([]);
+        setLocation((l) => ({ ...l, address: text, lat: null, lng: null, label: null, timeZone: null, elevationM: null }));
+        return;
+      }
+      setGeoStatus("resolving");
+      const site = await resolveSite(text);
+      if (seq !== geoSeqRef.current) return; // a newer commit already won
+      if (!site) {
+        setGeoStatus("missing");
+        setGeoAlternatives([]);
+        // Keep the typed text but drop any stale coordinates — an unresolved address
+        // must never leave the previous site silently attached to it.
+        setLocation((l) => ({ ...l, address: text, lat: null, lng: null, label: null, timeZone: null, elevationM: null }));
+        return;
+      }
+      setGeoStatus("resolved");
+      setGeoAlternatives(site.alternatives);
+      setLocation((l) => ({
+        ...l,
+        // Auto-populate the field with what was actually matched, so the text in the
+        // box and the site driving the study always read as the same thing.
+        address: canonicalAddress(site),
+        lat: site.lat,
+        lng: site.lng,
+        label: site.label,
+        timeZone: site.timeZone,
+        elevationM: site.elevationM,
+      }));
+    },
+    [],
+  );
+
+  /** Apply one of the offered alternatives (the user correcting an ambiguous match). */
+  const pickAlternative = useCallback((p: Place) => {
+    geoSeqRef.current++; // any in-flight resolve is now stale
+    setGeoStatus("resolved");
+    setGeoAlternatives((alts) => alts.filter((a) => a !== p));
+    setLocation((l) => ({
+      ...l,
+      // Correcting the match rewrites the field too, for the same reason.
+      address: formatPlace(p),
+      lat: p.lat,
+      lng: p.lng,
+      label: formatPlace(p),
+      timeZone: p.timeZone,
+      elevationM: p.elevationM,
+    }));
+  }, []);
 
   // Drag state lives in a ref (no re-render needed mid-drag for tracking).
   //  - pan:        middle-drag the viewport
@@ -797,9 +1179,43 @@ export default function PolylineTool() {
         cell: { x0: number; x1: number; y0: number; y1: number };
         all: boolean;
       }
+    // Reference-image (underlay) transforms. `grabDX/DY` is the pointer's offset from
+    // the image's origin at grab time, so a move tracks the cursor without snapping the
+    // corner to it. Resize records which grip is in hand.
+    | { kind: "imageMove"; id: string; grabDX: number; grabDY: number }
+    | { kind: "imageResize"; id: string; handle: HandleKey }
+    // Whole-shape move: the grab offset from the shape's own origin, so the drag tracks
+    // the cursor without snapping the shape's corner to it.
+    | { kind: "shapeMove"; grabX: number; grabY: number }
+    // Whole-shape scale. `base` + `from` are the perimeter and its bounds as they were at
+    // PRESS time, and every frame of the drag scales `base` — never the live perimeter.
+    // The two must travel together: `from` is the frame `scalePerimeter`'s factors and
+    // anchor are expressed in, so applying them to geometry that has already been scaled
+    // (i.e. the live perimeter) re-applies the whole transform on top of itself. That
+    // compounds per pointer-move — outward drags explode, inward ones collapse the shape
+    // to a line — which is exactly the bug this pairing exists to prevent.
+    | { kind: "shapeScale"; handle: HandleKey; from: Bounds; base: Perimeter }
     | { kind: "erase"; collected: EraseTarget[]; last: Point }
     | { kind: "eraseVertex"; collected: number[]; edges: number[]; last: Point }
-    | { kind: "marquee"; startModel: Point };
+    | { kind: "marquee"; startModel: Point }
+    // cellpaint: click-drag across a focused panel's grid to sweep cells.
+    // `keys` dedupes cells already swept; `painted` is the live set being built;
+    // `moved` distinguishes a drag from a plain click (which toggles downCell when
+    // selecting); `last` is the previous cursor model point, so a fast drag samples ALONG
+    // the path (like the eraser) and never skips a cell between two pointer events.
+    // `brush` is the glazing type this stroke will APPLY on release, or null when the
+    // stroke is a plain selection. Captured at press rather than read from state at
+    // release, so a stroke always commits the material it started with.
+    | {
+        kind: "cellpaint";
+        edge: number;
+        downCell: { x0: number; x1: number; y0: number; y1: number };
+        keys: Set<string>;
+        painted: Array<{ edge: number; x0: number; x1: number; y0: number; y1: number }>;
+        moved: boolean;
+        last: Point;
+        brush: CellType | "none" | null;
+      };
   const dragRef = useRef<Drag | null>(null);
   // Timestamp (performance.now) of the last forward layer drill, so a rapid second
   // click (e.g. a habitual double-click) within DRILL_COOLDOWN_MS is ignored and one
@@ -818,8 +1234,8 @@ export default function PolylineTool() {
   const [redoStack, setRedoStack] = useState<HistoryEntry[]>([]);
   // Always-current document snapshot, refreshed every render, so the capture and
   // undo/redo helpers read fresh values without stale-closure bugs.
-  const docRef = useRef<DocSnapshot>({ perimeter, unravelHeights, unravelCells, panelDivisions, panelDividersH, panelMullionsV, panelMullionsH, panelCellFraming, panelCellTypes, panelCwType, unravelHeight, floorPlates });
-  docRef.current = { perimeter, unravelHeights, unravelCells, panelDivisions, panelDividersH, panelMullionsV, panelMullionsH, panelCellFraming, panelCellTypes, panelCwType, unravelHeight, floorPlates };
+  const docRef = useRef<DocSnapshot>({ perimeter, unravelHeights, unravelCells, panelDivisions, panelDividersH, panelMullionsV, panelMullionsH, panelCellFraming, panelCellTypes, panelCwType, unravelHeight, floorPlates, referenceImages });
+  docRef.current = { perimeter, unravelHeights, unravelCells, panelDivisions, panelDividersH, panelMullionsV, panelMullionsH, panelCellFraming, panelCellTypes, panelCwType, unravelHeight, floorPlates, referenceImages };
   // Pre-interaction snapshot for a drag / field edit, pushed on the FIRST actual
   // change (so a no-op press/focus never creates an empty undo step).
   const pendingRef = useRef<DocSnapshot | null>(null);
@@ -861,12 +1277,188 @@ export default function PolylineTool() {
     setPanelCwType(d.panelCwType);
     setUnravelHeight(d.unravelHeight);
     setFloorPlates(d.floorPlates);
+    setReferenceImages(d.referenceImages);
+    // The restored list may not contain the selected underlay (undoing an import), so
+    // drop a selection that no longer resolves rather than leaving grips on nothing.
+    setSelectedImageId((id) => (id && d.referenceImages.some((i) => i.id === id) ? id : null));
+    setHoveredImageHandle(null);
     setSelectedVertex(-1);
     setHoveredVertex(-1);
     setInsertPreview(null);
     setUnravelInputDraft({});
     pendingRef.current = null;
   }, []);
+
+  // ---------------------------------------------------------------------------
+  // REFERENCE IMAGES — decoding + import
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Keep the decoded-bitmap cache in step with the placed list: decode any underlay we
+   * have not seen, and drop bitmaps whose image is gone (deleted or undone).
+   *
+   * Keyed by ID and `src` never changes after import, so MOVING or RESIZING an image
+   * finds its bitmap already cached — a drag re-runs this effect but decodes nothing.
+   */
+  useEffect(() => {
+    const cache = imageBitmapsRef.current;
+    const live = new Set(referenceImages.map((i) => i.id));
+    for (const id of [...cache.keys()]) if (!live.has(id)) cache.delete(id);
+
+    let cancelled = false;
+    for (const img of referenceImages) {
+      if (cache.has(img.id)) continue;
+      const el = new Image();
+      el.onload = () => {
+        if (cancelled) return;
+        cache.set(img.id, el);
+        setBitmapTick((t) => t + 1); // one repaint, now that there is something to draw
+      };
+      el.src = img.src;
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [referenceImages]);
+
+  /** The model-space rect currently visible, used to place an import into view. */
+  const currentViewRect = useCallback(() => {
+    const { w, h } = sizeRef.current;
+    const centre = toModel(viewport, w / 2, h / 2);
+    const tl = toModel(viewport, 0, 0);
+    const br = toModel(viewport, w, h);
+    return { cx: centre.x, cy: centre.y, w: Math.abs(br.x - tl.x), h: Math.abs(br.y - tl.y) };
+  }, [viewport]);
+
+  /**
+   * Decode the chosen files and place each centred in the current view. Decoding is
+   * asynchronous (and a PDF pulls its parser on first use), so the button reports
+   * progress and any failure in words rather than silently doing nothing.
+   */
+  const importImageFiles = useCallback(
+    async (files: FileList | null) => {
+      if (!files || files.length === 0) return;
+      const list = [...files];
+      setImportStatus(list.length === 1 ? `Reading ${list[0].name}…` : `Reading ${list.length} files…`);
+
+      const placed: ReferenceImage[] = [];
+      const failures: string[] = [];
+      let droppedPages = false;
+      const view = currentViewRect();
+
+      for (const file of list) {
+        try {
+          const raster = await decodeImageFile(file);
+          if (raster.pages > 1) droppedPages = true;
+          const id = `img-${Date.now().toString(36)}-${placed.length}-${Math.random().toString(36).slice(2, 7)}`;
+          placed.push(placeInView(raster, view, id));
+        } catch (err) {
+          failures.push(err instanceof Error ? err.message : String(err));
+        }
+      }
+
+      if (placed.length > 0) {
+        // One history step for the whole import, so a single undo removes it all.
+        recordHistory();
+        setReferenceImages((prev) => [...prev, ...placed]);
+        setSelectedImageId(placed[placed.length - 1].id);
+        // Hand the user the SELECT tool with the new image already picked: placing an
+        // underlay is almost always followed by positioning it, and the grips only exist
+        // under Select. Without this the import would land with no visible handles.
+        setSelectMode(true);
+        setPanMode(false);
+        setEraserOn(false);
+      }
+
+      setImportStatus(
+        failures.length > 0
+          ? failures[0]
+          : droppedPages
+            ? "Imported page 1 — multi-page PDFs place their first page only."
+            : null,
+      );
+    },
+    [currentViewRect, recordHistory],
+  );
+
+  /** Open the file browser. The <input> is hidden; this is the Import button's action. */
+  const onImportClick = useCallback(() => {
+    setImportStatus(null);
+    // Clear the value first so re-choosing the SAME file still fires a change event.
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    fileInputRef.current?.click();
+  }, []);
+
+  /**
+   * Which resize grip (if any) is under a SCREEN point.
+   *
+   * Tested in screen space, not model space, because the grips are drawn at a fixed
+   * pixel size — a model-space tolerance would make them unhittable when zoomed out and
+   * absurdly large when zoomed in. The pad widens the drawn square into a comfortable
+   * target without changing how it looks.
+   */
+  const hitImageHandleAt = useCallback(
+    (img: ReferenceImage, sx: number, sy: number): HandleKey | null => {
+      const pad = IMAGE_HANDLE_HIT_PX;
+      for (const k of HANDLE_KEYS) {
+        const p = toScreen(viewport, imageHandlePoint(img, k));
+        if (Math.abs(sx - p.x) <= pad && Math.abs(sy - p.y) <= pad) return k;
+      }
+      return null;
+    },
+    [viewport],
+  );
+
+  /**
+   * Model bounds of the drawn shape while it is selected as an object, else null. Feeds
+   * both the frame the renderer draws and the grip hit-testing below. Curve-accurate:
+   * measured on the flattened outline, so a bulging wall is inside its own box.
+   */
+  const selectedPerimeterBounds = useMemo<Bounds | null>(
+    () => (perimeterSelected && !unravelOn ? perimeterBounds(perimeter) : null),
+    [perimeterSelected, unravelOn, perimeter],
+  );
+
+  /**
+   * Which whole-shape grip is under a SCREEN point. Hit-tested in screen space with the
+   * same pad the underlay grips use, so both feel identically forgiving at any zoom.
+   */
+  const hitShapeHandleAt = useCallback(
+    (b: Bounds, sx: number, sy: number): HandleKey | null => {
+      const pad = IMAGE_HANDLE_HIT_PX;
+      for (const k of HANDLE_KEYS) {
+        const p = toScreen(viewport, boundsHandlePoint(b, k));
+        if (Math.abs(sx - p.x) <= pad && Math.abs(sy - p.y) <= pad) return k;
+      }
+      return null;
+    },
+    [viewport],
+  );
+
+  /** The currently selected underlay, or null. */
+  const selectedImage = useMemo(
+    () => referenceImages.find((i) => i.id === selectedImageId) ?? null,
+    [referenceImages, selectedImageId],
+  );
+
+  /** Patch the selected underlay (opacity / lock toggles, and the drag commits). */
+  const updateSelectedImage = useCallback(
+    (patch: Partial<ReferenceImage>, history = true) => {
+      if (!selectedImageId) return;
+      if (history) recordHistory();
+      setReferenceImages((prev) => prev.map((i) => (i.id === selectedImageId ? { ...i, ...patch } : i)));
+    },
+    [selectedImageId, recordHistory],
+  );
+
+  /** Remove the selected underlay (Delete/Backspace, or the panel's Remove button). */
+  const deleteSelectedImage = useCallback(() => {
+    if (!selectedImageId) return;
+    recordHistory();
+    setReferenceImages((prev) => prev.filter((i) => i.id !== selectedImageId));
+    setSelectedImageId(null);
+    setHoveredImageHandle(null);
+  }, [selectedImageId, recordHistory]);
 
   const undo = useCallback(() => {
     if (undoStack.length === 0) return;
@@ -954,6 +1546,25 @@ export default function PolylineTool() {
     () => (unravelOn ? unravelPerimeter(perimeter, unravelGap) : null),
     [unravelOn, perimeter, unravelGap],
   );
+
+  /**
+   * WHICH WALL BORDER the per-panel statistics are reading — the SINGLE source of truth for
+   * that question, used by both the Statistics window (which computes its numbers from it)
+   * and the canvas (which draws the red anchor frame around it). -1 when no such reading is
+   * on screen and there is nothing to attribute.
+   *
+   * The rule the readouts have always used: the FOCUSED border if one is selected, else the
+   * LEFT-MOST elevation. That fallback is the reason this needs to be visible at all — a
+   * user who has focused nothing still gets real numbers, for a wall they never picked, and
+   * previously nothing on screen said which one.
+   */
+  const statsAnchorPanel = useMemo(() => {
+    if (!unravelOn || !unravelResult || unravelResult.segments.length === 0) return -1;
+    if (!activeStatsModes.some(isPerPanelStat)) return -1; // nothing panel-scoped is shown
+    if (focusedPanel !== null && unravelResult.segments.some((s) => s.index === focusedPanel))
+      return focusedPanel;
+    return unravelResult.segments[0].index;
+  }, [unravelOn, unravelResult, activeStatsModes, focusedPanel]);
 
   // Effective height for one panel: its per-edge override, else the global default.
   const effectiveHeight = useCallback(
@@ -1198,6 +1809,37 @@ export default function PolylineTool() {
     [unravelResult, viewport, effectiveHeight],
   );
 
+  /**
+   * How much of the canvas is COVERED by the floating windows, measured live from the DOM.
+   *
+   * The canvas fills the window and the panels float on top of it, so its pixel width is
+   * NOT its visible width. Every fit below frames content into the region this leaves, or
+   * the content's left and right ends end up underneath a panel.
+   *
+   * Measured rather than read from a CSS token because the windows are not a fixed width in
+   * practice: the Statistics window grows with the readings switched on, the Selected image
+   * window only exists while an underlay is picked, and any of them can be restyled. A
+   * hard-coded number would be right on the day it was written and quietly wrong after.
+   * Each window is assigned to whichever side it sits nearer, so the two columns are
+   * measured independently — the layout is not symmetric and must not be assumed to be.
+   */
+  const canvasInsets = useCallback((): FitInsets => {
+    const wrap = wrapRef.current;
+    if (!wrap) return {};
+    const wr = wrap.getBoundingClientRect();
+    let left = 0;
+    let right = 0;
+    for (const el of Array.from(wrap.querySelectorAll<HTMLElement>(".mini"))) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue; // hidden / not laid out yet
+      const fromLeft = r.left - wr.left;
+      const fromRight = wr.right - r.right;
+      if (fromLeft <= fromRight) left = Math.max(left, r.right - wr.left);
+      else right = Math.max(right, wr.right - r.left);
+    }
+    return { left, right };
+  }, []);
+
   /** Zoom the viewport to fit a single panel's rectangle (double-click action). */
   const zoomToPanel = useCallback(
     (edge: number) => {
@@ -1205,15 +1847,29 @@ export default function PolylineTool() {
       if (!seg) return;
       const { w, h } = sizeRef.current;
       const h0 = effectiveHeight(edge);
-      // Fit just this rectangle with a comfortable margin so it fills the screen.
-      // Animate the transition so the zoom-in glides instead of snapping.
-      animateViewport(fitViewport(unravelBoundsPerimeter([seg], () => h0), w, h, 56));
+      // Fit this rectangle into the region BETWEEN the floating panels, with a margin, and
+      // animate so the zoom glides instead of snapping. The scale follows the rectangle's
+      // own width, so a short wall zooms in further than a long one — both end up framed
+      // the same way, clear of the panels on either side.
+      //
+      // There is no fill-factor pull-back here any more. The old 0.8 was compensating for
+      // this very bug: the fit was computed against the FULL canvas, so it framed content
+      // wider than the visible region and the ends disappeared under the panels; backing
+      // off 20% hid some of that but could not fix it, because the error scales with how
+      // wide the panels are, not with the content. Measuring the region removes the cause,
+      // and `marginPx` alone now sets the breathing room — in real pixels, predictably.
+      animateViewport(
+        fitViewport(unravelBoundsPerimeter([seg], () => h0), w, h, 56, undefined, 1, canvasInsets()),
+      );
       setFocusedPanel(edge);
       // Selecting / re-framing a PANEL leaves any deeper Assembly cell context, so
       // clear it — never carry a stale focused cell from another panel.
       setFocusedCell(null);
+      // A freshly-focused panel starts in the per-column / per-row GRID readout (the
+      // overall-dimension mode is a per-panel state, not carried between borders).
+      setPanelDimsOverall(false);
     },
-    [unravelResult, effectiveHeight, animateViewport],
+    [unravelResult, effectiveHeight, animateViewport, canvasInsets],
   );
 
   /**
@@ -1393,8 +2049,20 @@ export default function PolylineTool() {
    */
   const activeSolar = useMemo<SolarSettings>(() => {
     const entry = activeSavedId ? saved.find((s) => s.id === activeSavedId) : null;
-    return entry?.solar ?? defaultSolarSettings();
-  }, [activeSavedId, saved]);
+    // cloneSolarSettings (not a raw read) so a project saved before the time-zone /
+    // elevation fields existed gets them backfilled rather than reaching the radiation
+    // model as undefined.
+    const base = entry?.solar ? cloneSolarSettings(entry.solar) : defaultSolarSettings();
+    // The LIVE Location field is the site's source of truth: an address resolved just
+    // now must drive the study immediately, including on a not-yet-saved sketch.
+    if (location.lat !== null && location.lng !== null) {
+      base.latitude = location.lat;
+      base.longitude = location.lng;
+      if (location.timeZone) base.timeZone = location.timeZone;
+      if (typeof location.elevationM === "number") base.elevationM = location.elevationM;
+    }
+    return base;
+  }, [activeSavedId, saved, location]);
 
   /**
    * TRUE compass bearing (deg, 0 = N, CW) that each perimeter EDGE's glass faces —
@@ -1664,30 +2332,6 @@ export default function PolylineTool() {
     cellsForEdge,
   ]);
 
-  /**
-   * Pick the TOP-LEFT-most cell of a grid: the left-most column (minimum x), and
-   * within that column the top-most row (maximum y, since model +Y points up).
-   * Returns null for an empty grid.
-   */
-  const topLeftCell = useCallback(
-    (cells: { x0: number; x1: number; y0: number; y1: number }[]) => {
-      if (cells.length === 0) return null;
-      return cells.reduce((best, c) => {
-        if (c.x0 < best.x0 - 1e-6) return c; // strictly further left → take it
-        if (c.x0 > best.x0 + 1e-6) return best; // strictly further right → keep best
-        return c.y1 > best.y1 + 1e-6 ? c : best; // same column → prefer the higher (top) row
-      });
-    },
-    [],
-  );
-
-  /** Has this panel been split by the Subtractive tool (vertical and/or horizontal)?
-   *  Gates the Assembly button — there is nothing deeper to navigate until it has. */
-  const panelHasSubtractiveCells = useCallback(
-    (edge: number) => (panelDivisions[edge]?.length ?? 0) > 0 || (panelDividersH[edge]?.length ?? 0) > 0,
-    [panelDivisions, panelDividersH],
-  );
-
   /** Zoom the viewport to fit a single grid CELL (Assembly phase). Mirrors
    *  zoomToPanel but frames the cell's full rectangle (y0..y1, not baseline→top). */
   const zoomToCell = useCallback(
@@ -1710,29 +2354,32 @@ export default function PolylineTool() {
       // and neighbors, so we intentionally show more of the surroundings. Halving
       // the scale (not just widening the margin) makes the cell appear ~half size
       // in a way that is predictable regardless of the cell's aspect ratio.
-      const fit = fitViewport(bounds, w, h, 44);
-      // Zoom about the canvas center (w/2, h/2) as a fixed screen anchor so the cell
-      // stays centered while shrinking — same "anchor + (origin - anchor) * applied"
-      // transform used by zoomAt() in core/viewport.ts, here with applied = 0.5.
+      const insets = canvasInsets();
+      const fit = fitViewport(bounds, w, h, 44, undefined, 1, insets);
+      // Zoom about the centre of the VISIBLE region as a fixed screen anchor so the cell
+      // stays put while shrinking — same "anchor + (origin - anchor) * applied" transform
+      // used by zoomAt() in core/viewport.ts, here with applied = 0.5. It has to be the
+      // visible centre, not the canvas centre: anchoring on the canvas would slide the
+      // cell toward (and under) a panel as it shrank, undoing the fit just computed.
+      const anchorX = (insets.left ?? 0) + (w - (insets.left ?? 0) - (insets.right ?? 0)) / 2;
+      const anchorY = h / 2;
       const factor = 0.5;
       const less = {
         scale: fit.scale * factor,
-        originX: w / 2 + (fit.originX - w / 2) * factor,
-        originY: h / 2 + (fit.originY - h / 2) * factor,
+        originX: anchorX + (fit.originX - anchorX) * factor,
+        originY: anchorY + (fit.originY - anchorY) * factor,
       };
       animateViewport(less);
       setFocusedCell(cell);
     },
-    [animateViewport],
+    [animateViewport, canvasInsets],
   );
 
-  // Close EVERY drop-down / submenu (CW Type · Floor Lines · View · Statistics) in
+  // Close EVERY drop-down / submenu (CW Type · Glazing) in
   // one call. Used whenever a tool is armed or another menu opens, so only one menu
   // surface is ever open.
   const closeAllMenus = useCallback(() => {
     setCwMenuOpen(false);
-    setViewMenuOpen(false);
-    setStatsMenuOpen(false);
     // Arming any cluster tool (each calls this first) also disarms the Export-select
     // tool, so only one tool/mode is ever active. Re-armed last by toggleExportSelect.
     setExportSelectMode(false);
@@ -1743,6 +2390,21 @@ export default function PolylineTool() {
   // and drop their in-flight previews. Called when the user clicks ANY other button
   // so an armed tool never lingers (stays blue) while the user interacts elsewhere —
   // no canvas click or Esc required first.
+  /**
+   * Return to SELECT — the app's RESTING TOOL in both phases.
+   *
+   * The rule: when no other tool is armed, Select is. There is no "nothing armed" state,
+   * because that state has no answer to "what will a click do?" — the bar would show
+   * every button white while a click still did something. So every path that puts a tool
+   * DOWN (Escape, toggling a tool off, clicking away from it, switching phase) comes back
+   * here rather than to nothing.
+   *
+   * It only arms; it clears nothing. Callers that also need to drop a selection say so.
+   */
+  const armSelectDefault = useCallback(() => {
+    setSelectMode(true);
+  }, []);
+
   const disarmClusterTools = useCallback(() => {
     setFloorPlateMode(false);
     setSubtractiveOn(false);
@@ -1759,6 +2421,15 @@ export default function PolylineTool() {
     setCellEdgeHover(null);
     setCellFrameDraft(null);
     setTypeOn(false);
+    setGlazingBrush(null); // ...and unload the glazing brush — another tool owns the click now
+    // Select can now be armed in BOTH phases (it is the default in Elevations), so it has
+    // to be released here too — otherwise arming a cluster tool would leave two buttons
+    // lit and the bar would stop saying what a click does.
+    setSelectMode(false);
+    setSelectedImageId(null);
+    setHoveredImageHandle(null);
+    // ...and the whole-shape frame: another tool is taking the left click.
+    setPerimeterSelected(false);
     // Menu opens (which call this) also disarm the Export-select tool.
     setExportSelectMode(false);
     setMarquee(null);
@@ -1817,8 +2488,6 @@ export default function PolylineTool() {
   // available — it is NOT gated on a selected panel.
   const onCwType = useCallback(() => {
     setCwMenuOpen((open) => !open);
-    setViewMenuOpen(false);
-    setStatsMenuOpen(false);
     disarmClusterTools();
   }, [disarmClusterTools]);
   /**
@@ -1908,6 +2577,7 @@ export default function PolylineTool() {
     // so the user always sees what they're editing (mirrors the Floor Lines button).
     setFramingVisible(true);
     closeAllMenus();
+    setPanMode(false); // Pan owns the left drag while armed — arming a tool releases it
     setFloorPlateMode(false);
     setSubtractiveOn(false);
     setDivideHover(null);
@@ -1927,17 +2597,47 @@ export default function PolylineTool() {
     });
   }, [cwType, closeAllMenus]);
 
-  // TYPE: opens the Vision / Spandrel / Opaque chooser submenu (drop-up, same rules as the
-  // CW Type menu). Gated by `canType` in the UI (the focused panel has cells to type).
-  // Toggling it open closes every other menu and disarms every cluster tool (mutual
-  // exclusion), turning the button blue while open. Picking an option (selectCellType)
-  // does the actual assignment — restricted to the Cells tab.
+  /**
+   * Disarm the Select tool AND drop its object selection. The two always go together:
+   * the transform grips are drawn only while Select is armed, so a selection left behind
+   * would be invisible yet still take the Delete key.
+   */
+  const disarmSelect = useCallback(() => {
+    setSelectMode(false);
+    setSelectedImageId(null);
+    setHoveredImageHandle(null);
+    // The whole-shape frame is Select's too — leaving it drawn after the tool is gone
+    // would advertise grips that nothing would answer.
+    setPerimeterSelected(false);
+    setHoveredPerimeterHandle(null);
+    setOverShapeBody(false);
+  }, []);
+
+  // GLAZING: the button OPENS THE CHOOSER. That is its whole job, in every state.
+  //   • CHOOSER CLOSED (brush loaded or not) -> open it. Opening while a brush is already
+  //     loaded is the common case — switching material is one click, not a disarm-then-
+  //     rearm round trip — so a loaded brush must NOT make the button mean something else.
+  //   • CHOOSER OPEN -> close it. A loaded brush SURVIVES: closing is "done picking", not
+  //     "put the tool down".
+  // Putting the tool DOWN is therefore Esc, arming another tool, or re-picking the material
+  // already in hand (see armGlazingBrush) — never an unlabelled second click on the button,
+  // which is what made re-opening the chooser cost two clicks.
+  // Gated by `canType` in the UI (a wall border is focused, so there are cells to paint).
   const onType = useCallback(() => {
     if (!unravelOn || focusedPanel === null) return; // disabled in the UI, but guard anyway
+    if (typeOn) {
+      setTypeOn(false);
+      // Closed with nothing in hand: there is no armed tool left, so fall back to Select.
+      // With a brush loaded the tool IS still in hand, so leave it there.
+      if (glazingBrush === null) armSelectDefault();
+      return;
+    }
     // Restore hatch visibility on open so the assignment the user is about to make is shown
     // (mirrors the Floor Lines / Framing buttons restoring their elements' visibility).
     setTypeVisible(true);
     closeAllMenus();
+    setPanMode(false); // Pan owns the left drag while armed — arming a tool releases it
+    disarmSelect(); // ...and Select owns the left CLICK, which the brush is taking over
     setFloorPlateMode(false);
     setSubtractiveOn(false);
     setDivideHover(null);
@@ -1949,32 +2649,45 @@ export default function PolylineTool() {
     setMullionDraft(null);
     setCellEdgeHover(null);
     setCellFrameDraft(null);
-    setTypeOn((on) => !on);
-  }, [unravelOn, focusedPanel, closeAllMenus]);
+    // A fresh arm starts from an empty highlight: whatever was selected for DIMENSIONS is
+    // not what the brush is about to paint, and leaving it lit would say otherwise.
+    setSelectedCells([]);
+    setTypeOn(true);
+  }, [unravelOn, focusedPanel, typeOn, glazingBrush, closeAllMenus, armSelectDefault, disarmSelect]);
 
   /**
-   * SELECT the grid cell at model rect `cell` (owned by `edge`) for type assignment.
-   * A plain click (`sameId` false) TOGGLES just that one cell: clicking an unselected
-   * cell selects only it (replacing the current selection); re-clicking a cell that is
-   * already selected removes it (deselect). Shift+click (`sameId` true) selects EVERY
-   * cell sharing this cell's Material ID (geometric shape) across the whole project, so
-   * a bulk family can be typed at once. Wall Border (panels) phase only; gated by the
-   * click handler.
+   * Every cell sharing `cell`'s MATERIAL ID (its geometric shape), project-wide — walking
+   * each panel's grid, the way the Framing tool mirrors across the same family. This is the
+   * scope of a Shift gesture on a cell: identical cells are one product, so they are
+   * selected (or painted) together.
+   */
+  const cellsOfSameMaterial = useCallback(
+    (cell: { x0: number; x1: number; y0: number; y1: number }) => {
+      const key = cellShapeColors.keyOf(cell);
+      const out: Array<{ edge: number; x0: number; x1: number; y0: number; y1: number }> = [];
+      for (const seg of unravelResult?.segments ?? []) {
+        for (const c of cellsForEdge(seg.index)) {
+          if (cellShapeColors.keyOf(c) === key)
+            out.push({ edge: seg.index, x0: c.x0, x1: c.x1, y0: c.y0, y1: c.y1 });
+        }
+      }
+      return out;
+    },
+    [cellShapeColors, unravelResult, cellsForEdge],
+  );
+
+  /**
+   * SELECT the grid cell at model rect `cell` (owned by `edge`) — the no-brush gesture,
+   * which drives the per-cell dimension readout. A plain click (`sameId` false) TOGGLES
+   * just that one cell: clicking an unselected cell selects only it (replacing the current
+   * selection); re-clicking a cell that is already selected removes it (deselect).
+   * Shift+click (`sameId` true) selects the whole Material-ID family. Wall Border (panels)
+   * phase only; gated by the click handler.
    */
   const selectCellAt = useCallback(
     (edge: number, cell: { x0: number; x1: number; y0: number; y1: number }, sameId: boolean) => {
       if (sameId) {
-        // Shift: every cell of this Material ID (shape), project-wide — walk each panel's
-        // grid (mirrors the Framing tool's Material-ID mirroring).
-        const key = cellShapeColors.keyOf(cell);
-        const out: Array<{ edge: number; x0: number; x1: number; y0: number; y1: number }> = [];
-        for (const seg of unravelResult?.segments ?? []) {
-          for (const c of cellsForEdge(seg.index)) {
-            if (cellShapeColors.keyOf(c) === key)
-              out.push({ edge: seg.index, x0: c.x0, x1: c.x1, y0: c.y0, y1: c.y1 });
-          }
-        }
-        setSelectedCells(out);
+        setSelectedCells(cellsOfSameMaterial(cell));
         return;
       }
       // Plain click: TOGGLE this single cell. Already selected → deselect it; otherwise
@@ -2002,50 +2715,92 @@ export default function PolylineTool() {
         return [{ edge, x0: cell.x0, x1: cell.x1, y0: cell.y0, y1: cell.y1 }];
       });
     },
-    [cellShapeColors, unravelResult, cellsForEdge],
+    [cellsOfSameMaterial],
   );
 
   /**
-   * Assign glazing TYPE `t` to EVERY currently-SELECTED cell — or CLEAR the type when
-   * `t` is "none" (un-assigns, dropping the cell back to untyped / no hatch). The
-   * selection already encodes scope (a single click selects one cell, Shift+click the
-   * whole Material-ID family), so this just maps each selected rect back to its panel
-   * grid index and sets / deletes the type. No-op with an empty selection (the Type
-   * button gates this); one undoable step. Closes the submenu after.
+   * LOAD the glazing brush with type `t` and close the chooser. This ASSIGNS NOTHING — the
+   * user applies it by clicking a cell or dragging across a run of them. Splitting "pick the
+   * material" from "say where it goes" is what lets a single choice cover many strokes, and
+   * it is what makes a paint DRAG meaningful (a drag can only sweep cells; it cannot also
+   * answer "as what?").
+   *
+   * Picking the material ALREADY in hand puts the tool down instead. Since the button now
+   * always opens the chooser, the chooser has to carry the off switch — and "click the lit
+   * option to turn it off" is the same gesture every other toggle in the bar uses.
+   *
+   * Any existing highlight is dropped: it was a dimension selection, not a paint target.
    */
-  const selectCellType = useCallback(
+  const armGlazingBrush = useCallback(
     (t: CellType | "none") => {
       setTypeOn(false);
-      if (selectedCells.length === 0) return; // requires a selection (button gates this too)
+      setSelectedCells([]);
+      if (glazingBrush === t) {
+        setGlazingBrush(null);
+        armSelectDefault(); // nothing in hand — back to the resting tool
+      } else {
+        setGlazingBrush(t);
+      }
+    },
+    [glazingBrush, armSelectDefault],
+  );
+
+  /**
+   * APPLY glazing type `t` to `cells` — or CLEAR the type when `t` is "none" (un-assigns,
+   * dropping each cell back to untyped / no hatch). One undoable step for the whole set, so
+   * a drag across twenty cells undoes as the single stroke the user made, not twenty.
+   *
+   * Each rect is mapped back to its panel grid INDEX here rather than being stored as one,
+   * because the grid can change under a stale rect; a rect that no longer matches a cell is
+   * skipped silently instead of writing a type onto the wrong cell.
+   *
+   * Cells that ALREADY carry `t` are dropped first, and a stroke that changes nothing records
+   * no history at all. Painting over what is already there is not an edit, and a brush invites
+   * exactly that — overlapping strokes, a double-click that lands twice — none of which should
+   * cost the user an undo press to get back through.
+   */
+  const applyGlazingTo = useCallback(
+    (
+      t: CellType | "none",
+      cells: Array<{ edge: number; x0: number; x1: number; y0: number; y1: number }>,
+    ) => {
+      // Resolve every rect to its (edge, grid index) and keep only the cells this stroke
+      // actually CHANGES.
+      const targets: Array<{ edge: number; idx: number }> = [];
+      for (const sc of cells) {
+        const grid = cellsForEdge(sc.edge);
+        const idx = grid.findIndex(
+          (c) =>
+            Math.abs(c.x0 - sc.x0) < 1e-6 &&
+            Math.abs(c.y0 - sc.y0) < 1e-6 &&
+            Math.abs(c.x1 - sc.x1) < 1e-6 &&
+            Math.abs(c.y1 - sc.y1) < 1e-6,
+        );
+        if (idx < 0) continue; // stale rect (grid changed) — skip silently
+        const current: CellType | "none" = panelCellTypes[sc.edge]?.[idx] ?? "none";
+        if (current !== t) targets.push({ edge: sc.edge, idx });
+      }
+      if (targets.length === 0) return; // nothing to change — no history entry
       recordHistory();
       setPanelCellTypes((prev) => {
         const next = { ...prev };
-        for (const sc of selectedCells) {
-          const cells = cellsForEdge(sc.edge);
-          const idx = cells.findIndex(
-            (c) =>
-              Math.abs(c.x0 - sc.x0) < 1e-6 &&
-              Math.abs(c.y0 - sc.y0) < 1e-6 &&
-              Math.abs(c.x1 - sc.x1) < 1e-6 &&
-              Math.abs(c.y1 - sc.y1) < 1e-6,
-          );
-          if (idx < 0) continue; // stale rect (grid changed) — skip silently
+        for (const { edge, idx } of targets) {
           if (t === "none") {
             // Clear: drop this cell's entry (and the whole panel map if it empties out).
-            if (next[sc.edge]) {
-              const panel = { ...next[sc.edge] };
+            if (next[edge]) {
+              const panel = { ...next[edge] };
               delete panel[idx];
-              if (Object.keys(panel).length === 0) delete next[sc.edge];
-              else next[sc.edge] = panel;
+              if (Object.keys(panel).length === 0) delete next[edge];
+              else next[edge] = panel;
             }
           } else {
-            next[sc.edge] = { ...(next[sc.edge] ?? {}), [idx]: t };
+            next[edge] = { ...(next[edge] ?? {}), [idx]: t };
           }
         }
         return next;
       });
     },
-    [selectedCells, cellsForEdge, recordHistory],
+    [cellsForEdge, panelCellTypes, recordHistory],
   );
 
   /** Interior GRID-LINE positions of a panel (the lines the Mullions tool targets):
@@ -2068,6 +2823,38 @@ export default function PolylineTool() {
     },
     [unravelResult, effectiveHeight, unravelCells, panelDivisions, panelDividersH],
   );
+
+  /**
+   * ESTIMATED COST of the whole facade — every wall border, priced from what has actually
+   * been drawn and assigned. Null outside the Elevations phase, where there are no unrolled
+   * walls to price.
+   *
+   * This is the geometry-gathering half; the money is in core/cost.ts, which is pure and
+   * tested. Two things are handed to it per panel:
+   *   • CELLS — each one's opening area and its assigned glazing type (null = untyped, which
+   *     cost.ts deliberately leaves unpriced rather than guessing a rate for).
+   *   • FRAMING LENGTH — the panel's perimeter frame plus every interior grid line, each
+   *     running the full width or height it spans. Framing is charged per linear foot, so a
+   *     finely subdivided panel costs more than a coarse one of the same area — which is
+   *     true of real curtain wall, and is why the Centerlines tool moves this number.
+   */
+  const costEstimate = useMemo(() => {
+    if (!unravelOn || !unravelResult) return null;
+    const panels: PanelCostInput[] = unravelResult.segments.map((seg) => {
+      const edge = seg.index;
+      const types = panelCellTypes[edge] ?? {};
+      const cells = cellsForEdge(edge).map((c, i) => ({
+        area: Math.abs(c.x1 - c.x0) * Math.abs(c.y1 - c.y0),
+        type: types[i] ?? null,
+      }));
+      const width = Math.abs(seg.x1 - seg.x0);
+      const height = effectiveHeight(edge);
+      const { vx, hy } = gridLinesForEdge(edge);
+      const framingLength = 2 * (width + height) + vx.length * height + hy.length * width;
+      return { edge, cells, framingLength };
+    });
+    return buildCostEstimate(panels);
+  }, [unravelOn, unravelResult, panelCellTypes, cellsForEdge, effectiveHeight, gridLinesForEdge]);
 
   /** The interior grid line of `edge` NEAREST the model point, within hit tolerance,
    *  as which AXIS its set belongs to + the grabbed line's coordinate (x for vertical,
@@ -2170,6 +2957,7 @@ export default function PolylineTool() {
     closeAllMenus();
     setFloorPlateMode((on) => {
       if (!on) {
+        setPanMode(false); // Pan owns the left drag while armed — arming a tool releases it
         setSubtractiveOn(false);
         setDivideHover(null);
         setDivideDraft(null);
@@ -2202,6 +2990,7 @@ export default function PolylineTool() {
     // (mirrors the Floor Lines button).
     setCenterlinesVisible(true);
     closeAllMenus();
+    setPanMode(false); // Pan owns the left drag while armed — arming a tool releases it
     // Mutually exclusive with the rest of the cluster: arming Subtractive disarms
     // the Floor plate tool and the Eraser and drops their previews (clicking
     // Subtractive while it's already on toggles it off — the others are already
@@ -2215,6 +3004,7 @@ export default function PolylineTool() {
     setCellEdgeHover(null);
     setCellFrameDraft(null);
     setTypeOn(false);
+    if (subtractiveOn) armSelectDefault(); // toggling OFF returns to the resting tool
     setSubtractiveOn((on) => {
       if (on) {
         setDivideHover(null);
@@ -2222,15 +3012,80 @@ export default function PolylineTool() {
       }
       return !on;
     });
-  }, [focusedPanel, closeAllMenus]);
+  }, [focusedPanel, closeAllMenus, subtractiveOn, armSelectDefault]);
 
   // ERASER: arm the line-DELETION tool for the selected panel — the destructive
   // counterpart to Subtractive. Toggling it off (or deselecting / Esc / leaving
   // the view) clears the in-flight deletion highlight. The actual removal happens
   // in the pointer handlers (hover targets the nearest line; a click deletes it).
+  /**
+   * PAN button — toggles the pan tool. While armed, a left click-drag on the canvas moves
+   * the view (same gesture as middle-drag, which keeps working regardless).
+   * Mutually exclusive with the other armed tools, exactly like Eraser / Subtractive:
+   * arming Pan disarms them and drops their previews, so a drag never runs two tools.
+   * Holding SPACE pans temporarily WITHOUT touching this toggle (see `spaceHeld`).
+   */
+  const onPan = useCallback(() => {
+    closeAllMenus();
+    disarmSelect();
+    setFloorPlateMode(false);
+    setSubtractiveOn(false);
+    setDivideHover(null);
+    setDivideDraft(null);
+    setEraserOn(false);
+    setEraseHover(null);
+    setMullionsOn(false);
+    setMullionHover(null);
+    setMullionDraft(null);
+    setCellEdgeHover(null);
+    setCellFrameDraft(null);
+    setTypeOn(false);
+    if (panMode) armSelectDefault(); // toggling OFF returns to the resting tool
+    setPanMode((on) => !on);
+  }, [closeAllMenus, disarmSelect, panMode, armSelectDefault]);
+
+  /**
+   * SELECT button — toggles the object-selection tool. Mutually exclusive with the other
+   * armed tools, the same way Pan and Eraser are.
+   *
+   * Disarming CLEARS the current object selection: the transform grips are only drawn
+   * while Select is armed, so leaving a selection behind would mean Delete still removed
+   * an image the user could no longer see was selected.
+   */
+  const onSelect = useCallback(() => {
+    closeAllMenus();
+    setPanMode(false);
+    setFloorPlateMode(false);
+    setSubtractiveOn(false);
+    setDivideHover(null);
+    setDivideDraft(null);
+    setEraserOn(false);
+    setEraseHover(null);
+    setMullionsOn(false);
+    setMullionHover(null);
+    setMullionDraft(null);
+    setCellEdgeHover(null);
+    setCellFrameDraft(null);
+    setTypeOn(false);
+    // ...and UNLOAD the glazing brush. Closing the chooser is not putting the tool down:
+    // a loaded brush keeps the click, and keeps the Glazing button blue, with no chooser
+    // open to say so. Taking Select means taking the click, so the brush has to go — this
+    // is what makes V (and the Select button) actually release Glazing.
+    setGlazingBrush(null);
+    setSelectMode((on) => {
+      if (on) {
+        setSelectedImageId(null);
+        setHoveredImageHandle(null);
+      }
+      return !on;
+    });
+  }, [closeAllMenus]);
+
   const onEraser = useCallback(() => {
     // No focusedPanel guard — eraser also targets floor plates (global, no panel needed).
     closeAllMenus();
+    setPanMode(false); // Pan owns the left drag while armed — arming a tool releases it
+    disarmSelect(); // likewise Select, which owns the left click for objects
     // Mutually exclusive with the rest of the cluster: arming it disarms Floor plate
     // and Subtractive and drops their previews so no two tools ever fight.
     setFloorPlateMode(false);
@@ -2243,6 +3098,8 @@ export default function PolylineTool() {
     setCellEdgeHover(null);
     setCellFrameDraft(null);
     setTypeOn(false);
+    setGlazingBrush(null); // same as Select: taking the click means unloading the brush
+    if (eraserOn) armSelectDefault(); // toggling OFF returns to the resting tool
     setEraserOn((on) => {
       // Disarming drops the unravel line highlight AND the perimeter vertex
       // hover (in Draw mode the move handler won't reset it otherwise).
@@ -2255,24 +3112,12 @@ export default function PolylineTool() {
       }
       return !on;
     });
-  }, [closeAllMenus]);
+  }, [closeAllMenus, disarmSelect, eraserOn, armSelectDefault]);
 
-  /**
-   * "View" button — toggles its dropdown menu of CELL VIEW MODES. It arms no tool and
-   * changes no document state (purely a display chooser), but like every other button
-   * it DISARMS any armed cluster tool so a tool never lingers (blue) when the user
-   * interacts elsewhere.
-   */
-  const onViewMenu = useCallback(() => {
-    setViewMenuOpen((open) => !open);
-    setCwMenuOpen(false);
-    setStatsMenuOpen(false);
-    disarmClusterTools();
-  }, [disarmClusterTools]);
-  /** Pick a display mode from the View menu (closes the menu). */
+  /** Pick a display mode from the left panel's Display ▸ View mode list. Purely visual:
+   *  it arms no tool and changes no document state, so there is nothing else to reset. */
   const selectViewMode = useCallback((m: CellViewMode) => {
     setCellViewMode(m);
-    setViewMenuOpen(false);
   }, []);
 
   /**
@@ -2583,9 +3428,11 @@ export default function PolylineTool() {
       const heightOf = (s: UnravelSegment) => heights[s.index] ?? defaultHeight;
       // Generous margin so the per-segment length labels above the strip fit.
       // Animate so exiting a double-click zoom (Esc) eases back out smoothly.
-      animateViewport(fitViewport(unravelBoundsPerimeter(res.segments, heightOf), w, h, 48));
+      animateViewport(
+        fitViewport(unravelBoundsPerimeter(res.segments, heightOf), w, h, 48, undefined, 1, canvasInsets()),
+      );
     },
-    [perimeter, animateViewport],
+    [perimeter, animateViewport, canvasInsets],
   );
 
   // ---------------------------------------------------------------------------
@@ -2600,15 +3447,117 @@ export default function PolylineTool() {
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
 
+      // UNROLL TRANSITION: a click SKIPS it — jump to the elevation view it was
+      // heading for and consume this press, so the click that skipped doesn't also
+      // land as an edit in a view the user hasn't seen yet.
+      if (unrollFrameRef.current) {
+        skipUnrollRef.current();
+        return;
+      }
+
       // A press means the user is taking over: stop any running zoom animation
       // so it doesn't fight their input.
       cancelAnim();
 
-      // Any press on the canvas dismisses an open Statistics / CW Type / View / Type menu.
-      if (statsMenuOpen) setStatsMenuOpen(false);
+      // Any press on the canvas dismisses an open CW Type / Glazing menu. (Statistics and
+      // View are no longer menus — they are lists in the Display window's Display section.)
       if (cwMenuOpen) setCwMenuOpen(false);
-      if (viewMenuOpen) setViewMenuOpen(false);
       if (typeOn) setTypeOn(false);
+
+      // PAN (button armed, or SPACE held): a LEFT drag moves the VIEW. Checked FIRST so
+      // it takes precedence over every tool — while panning, a press must never draw a
+      // vertex, drop a floor line, select a panel, or erase anything. Middle-drag still
+      // pans independently below. Pointer capture keeps the drag alive if the cursor
+      // leaves the canvas mid-stroke.
+      if (panArmed && e.button === 0) {
+        dragRef.current = { kind: "pan", lastX: sx, lastY: sy, button: 0, moved: false };
+        canvasRef.current?.setPointerCapture(e.pointerId);
+        return;
+      }
+
+      // SELECT tool: OBJECT selection. While armed it owns the left click entirely and
+      // returns in every case, so perimeter vertices are inert — that total separation
+      // from Edit is the point of having the tool, and it means no priority rule is
+      // needed between a vertex and an underlay.
+      // (`!unravelOn` IS the perimeter phase — `phase` itself is derived further down.)
+      if (selectMode && !unravelOn && e.button === 0) {
+        const mu = toModel(viewport, sx, sy);
+        // HIT ORDER IS PAINT ORDER, TOP DOWN — whatever is drawn over the click is what
+        // the click means, which is the only rule a user can predict without being told.
+        // The renderer draws, bottom to top: underlays -> geometry -> the underlay's
+        // frame+grips -> the shape's frame+grips (see drawBackdrop / drawTransformFrame).
+        // So the tests below run in exactly the reverse of that.
+        //
+        // This used to test underlays FIRST, on the reasoning that they sit beneath the
+        // geometry — which inverts the very rule it cites. Once underlays were forced to
+        // draw behind the drawing, that made a traced footprint unselectable: every click
+        // inside it landed on the underlay it was traced over, and dragging moved the
+        // reference image instead of the building.
+
+        // 1. THE SHAPE'S GRIPS — drawn last of all, so they are hit first.
+        if (selectedPerimeterBounds) {
+          const grip = hitShapeHandleAt(selectedPerimeterBounds, sx, sy);
+          if (grip) {
+            beginHistory();
+            // Snapshot the perimeter alongside its bounds — the drag scales THIS, not the
+            // live shape, so the factors are applied exactly once per frame. Perimeter ops
+            // are immutable, so holding the reference is enough; nothing can edit it under
+            // us mid-drag.
+            dragRef.current = {
+              kind: "shapeScale",
+              handle: grip,
+              from: selectedPerimeterBounds,
+              base: perimeter,
+            };
+            return;
+          }
+        }
+        // 2. THE UNDERLAY'S GRIPS — they sit ON the frame, outside the body, and are
+        //    unambiguous; only an unlocked image has any.
+        const sel = referenceImages.find((i) => i.id === selectedImageId);
+        if (sel && !sel.locked) {
+          const grip = hitImageHandleAt(sel, sx, sy);
+          if (grip) {
+            beginHistory();
+            dragRef.current = { kind: "imageResize", id: sel.id, handle: grip };
+            return;
+          }
+        }
+        // 3. THE SHAPE'S BODY, as one object — it is drawn over every underlay.
+        //    Tolerance in MODEL units so the outline is equally easy to grab at any zoom.
+        if (
+          perimeter.vertices.length > 0 &&
+          hitPerimeterBody(perimeter, mu, pixelsToModel(viewport, HIT_TOLERANCE_PX))
+        ) {
+          setPerimeterSelected(true);
+          setSelectedImageId(null); // one object at a time
+          beginHistory(); // pushed on the first actual move, so a pure select is free
+          dragRef.current = { kind: "shapeMove", grabX: mu.x, grabY: mu.y };
+          return;
+        }
+        // 4. AN UNDERLAY'S BODY — the bottom of the stack, so the last thing tested.
+        //    Topmost (last drawn) image wins among themselves, same rule again.
+        //    LOCKED images are still SELECTABLE. Lock means "cannot be moved or resized",
+        //    not "cannot be picked": its Unlock button lives in the Selected image panel,
+        //    which only exists while the image is selected, so skipping locked images here
+        //    made a locked underlay permanently unlockable — clicking it fell through to
+        //    the deselect below and the panel vanished for good.
+        const hit = [...referenceImages].reverse().find((i) => hitImageBody(i, mu));
+        if (hit) {
+          setSelectedImageId(hit.id);
+          setPerimeterSelected(false); // one object at a time, in both directions
+          // Only an UNLOCKED image begins a move drag; a locked one is selected and left
+          // exactly where it is, which is the whole point of the lock.
+          if (!hit.locked) {
+            beginHistory(); // pushed on the first actual move, so a pure select is free
+            dragRef.current = { kind: "imageMove", id: hit.id, grabDX: mu.x - hit.x, grabDY: mu.y - hit.y };
+          }
+          return;
+        }
+        setSelectedImageId(null); // empty canvas clears the selection
+        setPerimeterSelected(false);
+        return;
+      }
 
       // FLOOR PLATE tool: while armed, a left-click drops a horizontal level line
       // at the cursor's elevation (or removes one already there). Takes precedence
@@ -2637,12 +3586,14 @@ export default function PolylineTool() {
         return;
       }
 
-      // RIGHT button pans (touchpads have no middle button).
-      if (e.button === 2) {
-        dragRef.current = { kind: "pan", lastX: sx, lastY: sy, button: 2, moved: false };
-        return;
-      }
-      // Middle button or space-less: pan with middle mouse.
+      // RIGHT button does NOTHING. It used to pan, from before Space+drag existed; now
+      // that Space+drag is the pan gesture (plus the Pan tool, plus middle-drag), the
+      // right button is deliberately left free rather than kept as a fourth way to do
+      // the same thing. The context menu stays suppressed over the canvas, so a
+      // right-click is simply inert — see onContextMenu on the canvas element.
+      if (e.button === 2) return;
+      // MIDDLE button pans — the CAD convention, and the one gesture that works with no
+      // tool armed and no key held.
       if (e.button === 1) {
         dragRef.current = { kind: "pan", lastX: sx, lastY: sy, button: 1, moved: false };
         return;
@@ -2673,11 +3624,14 @@ export default function PolylineTool() {
             beginHistory(); // pushed on commit (pointer-up)
             dragRef.current = { kind: "divide", edge: focusedPanel };
             setDivideHover(null);
-            // Shift flips the split axis: HORIZONTAL equal-height rows (from the
-            // cursor's distance above the baseline) instead of VERTICAL equal-width
-            // columns. Both use the SAME pure generators as the live preview/commit.
-            if (shiftHeld) {
-              const panelH = effectiveHeight(focusedPanel);
+            // The split AXIS comes from where inside the panel the press landed (see
+            // divideAxisAt) — no modifier key. It is captured on the draft HERE and never
+            // recomputed during the drag, so dragging to re-pick the spacing can never
+            // flip rows into columns underneath the user.
+            const panelH = effectiveHeight(focusedPanel);
+            const lo = Math.min(seg.x0, seg.x1);
+            const hi = Math.max(seg.x0, seg.x1);
+            if (divideAxisAt(mu, lo, hi, panelH) === "h") {
               // Floor plates crossing the panel act as guides the rows snap to.
               setDivideDraft({ edge: focusedPanel, axis: "h", lines: buildEqualRows(mu.y, 0, panelH, floorPlates) });
             } else {
@@ -2809,39 +3763,77 @@ export default function PolylineTool() {
           setHoveredUnravelTop(edge);
           return;
         }
-        // LAYER NAVIGATION (single click). A single left-click is the ONE gesture that
-        // moves between layers, both directions:
-        //   • click ON a panel/cell  -> drill exactly ONE layer DEEPER
+        // LAYER NAVIGATION (single click).
+        //   • click ON a panel/cell  -> drill exactly ONE layer DEEPER (zoom IN)
         //       Elevations -> Panels (zoom the clicked panel)
         //       Panels     -> Assembly (zoom the clicked cell of a SPLIT panel)
         //       Assembly   -> the cell under the cursor (keep going cell by cell)
         //     ...except when already focused on a panel (Panels/Assembly): clicking a
         //     DIFFERENT panel switches focus straight to it, no back-out click needed.
-        //   • click on the empty WHITE canvas -> step ONE layer BACK, deepest-first
-        //       Assembly -> Panels, Panels -> Elevations, Elevations -> stays put
-        //       (only the Perimeter TAB returns to the footprint).
+        //   • click on the empty WHITE canvas -> step BACK, deepest-first. The CAMERA never
+        //       zooms out here — only the dimension READOUT changes:
+        //       Assembly (single-cell zoom) -> back to its wall border.
+        //       Wall Border WITH cells selected -> DESELECT them (dimensions revert from the
+        //         per-cell readout to the per-column/row grid).
+        //       Wall Border with NOTHING selected -> collapse the dimensions to the panel's
+        //         OVERALL length + height (still zoomed in on the border; use the tabs to
+        //         return to the full strip).
         // "Empty canvas" = the click landed on no panel rectangle (hit-test === -1).
         if (hitUnravelPanel(mu) === -1) {
           if (focusedCell !== null && focusedPanel !== null) {
             setFocusedCell(null);
             zoomToPanel(focusedPanel);
           } else if (focusedPanel !== null) {
-            setFocusedPanel(null);
-            fitUnravel(unravelGap, unravelHeights, unravelHeight);
+            if (selectedCells.length > 0) {
+              setSelectedCells([]); // first click: drop the selection → back to the grid
+            } else {
+              setPanelDimsOverall(true); // then: grid → overall length + height (no zoom-out)
+            }
           }
           return;
         }
-        // WALL BORDER (panels) phase — CELL SELECTION for type assignment. A click on a
-        // cell of the FOCUSED panel selects it (Shift = the whole Material-ID family,
-        // project-wide) instead of drilling into the Assembly cell zoom. NOT subject to the
-        // drill cooldown so rapid multi-select clicks all register. A click on a DIFFERENT
-        // panel falls through to the layer-switch logic below (which clears the selection).
+        // WALL BORDER (panels) phase — a press on a cell of the FOCUSED panel starts a CELL
+        // STROKE instead of drilling into the Assembly cell zoom. What the stroke DOES on
+        // release depends on whether the Glazing brush is loaded: with a brush it paints
+        // that type onto every cell it swept; without one it selects them (which drives the
+        // per-cell dimension readout). Either way the gesture is identical — click one cell,
+        // or drag across a run — so there is one thing to learn, not two.
+        // A press on a DIFFERENT panel falls through to the layer-switch logic below.
         if (focusedPanel !== null && focusedCell === null && hitUnravelPanel(mu) === focusedPanel) {
           const target = cellsForEdge(focusedPanel).find(
             (c) => mu.x >= c.x0 && mu.x <= c.x1 && mu.y >= c.y0 && mu.y <= c.y1,
           );
-          if (target) selectCellAt(focusedPanel, target, e.shiftKey);
-          return; // consumed: selection (or a no-op click inside the panel) — keep focus
+          if (target) {
+            if (e.shiftKey) {
+              // Shift = the whole Material-ID family, project-wide, in one shot (no drag):
+              // painted immediately with a loaded brush, otherwise selected.
+              if (glazingBrush !== null) applyGlazingTo(glazingBrush, cellsOfSameMaterial(target));
+              else selectCellAt(focusedPanel, target, true);
+            } else {
+              // Begin the stroke: the press seeds the set with this one cell; dragging
+              // across more cells of THIS panel adds each live (see onPointerMove), which
+              // previews as the same blue highlight. Committed on release (onPointerUp).
+              dragRef.current = {
+                kind: "cellpaint",
+                edge: focusedPanel,
+                downCell: target,
+                keys: new Set([cellPosKey(focusedPanel, target)]),
+                painted: [{ edge: focusedPanel, x0: target.x0, x1: target.x1, y0: target.y0, y1: target.y1 }],
+                moved: false,
+                last: { x: mu.x, y: mu.y },
+                brush: glazingBrush,
+              };
+              // With a brush loaded the pressed cell previews right away, so a plain click
+              // shows its target before the release commits it.
+              if (glazingBrush !== null) {
+                setSelectedCells([
+                  { edge: focusedPanel, x0: target.x0, x1: target.x1, y0: target.y0, y1: target.y1 },
+                ]);
+              }
+              canvasRef.current?.setPointerCapture(e.pointerId);
+            }
+          }
+          return; // consumed: stroke start (or a no-op press inside the panel) — keep focus
         }
         // Click landed ON a panel/cell -> drill one layer deeper, OR sideways. Debounced
         // so a habitual double-click advances only one layer (see DRILL_COOLDOWN_MS).
@@ -3011,13 +4003,18 @@ export default function PolylineTool() {
       viewport,
       eventToModel,
       selectedVertex,
+      // The Select tool reads these; without them the handler keeps a stale empty list
+      // (or a stale selectMode === false) and would never hit-test an imported image.
+      selectMode,
+      referenceImages,
+      selectedImageId,
+      mode,
+      hitImageHandleAt,
       unravelOn,
       hitUnravelTop,
       hitUnravelPanel,
       focusedPanel,
-      statsMenuOpen,
       cwMenuOpen,
-      viewMenuOpen,
       typeOn,
       recordHistory,
       beginHistory,
@@ -3040,7 +4037,7 @@ export default function PolylineTool() {
       // (focusedCell is already listed below for layer navigation.)
       nearestCellEdge,
       panelCellFraming,
-      // Shift flips the Subtractive split axis (rows vs columns); effectiveHeight
+      // The cursor position picks the split axis (rows vs columns); effectiveHeight
       // resolves the panel height for the equal-row generator. Stale closures here
       // would lock the axis / use a stale height.
       shiftHeld,
@@ -3052,28 +4049,42 @@ export default function PolylineTool() {
       // stale closure (floorPlateMode === false) and clicks fall through to
       // draw/edit until an unrelated dep change rebuilds the callback.
       floorPlateMode,
+      // Pan gate (button armed OR Space held). Without it the handler keeps a stale
+      // closure and a left drag would run the previous tool instead of panning.
+      panArmed,
       // The floor-plate snap helper (reads floorPlates/shiftHeld/viewport). Listing
       // it here keeps placement in lock-step with the preview's snapped elevation.
       snapFloorPlateY,
       cancelAnim,
-      // Single-click layer navigation: a click ON a panel/cell drills one layer
-      // deeper, a click on the empty canvas backs out one layer (deepest-first:
-      // cell -> panel -> strip). These drive the hit-tests, re-frame, and current layer.
-      // (focusedPanel is already listed above for the Subtractive tool.)
+      // Single-click layer navigation: a click ON a panel/cell drills one layer deeper;
+      // a click on the empty canvas steps back (Assembly → wall border; Wall Border →
+      // deselect, then grid → overall dimensions, camera unchanged). These drive the
+      // hit-tests, re-frame, and current layer. (focusedPanel is listed above already.)
       focusedCell,
       cellsForEdge,
       zoomToCell,
       zoomToPanel,
-      // Wall Border cell SELECTION: a same-panel click selects the cell (Shift = the
-      // Material-ID family) via selectCellAt; a stale closure would mis-target the set.
+      // Wall Border cell STROKE: a same-panel press starts one, and whether it paints or
+      // selects is decided HERE from the loaded brush — a stale closure would start the
+      // stroke with the wrong (or no) material, and mis-target the Shift family.
       selectCellAt,
-      fitUnravel,
-      unravelGap,
-      unravelHeights,
-      unravelHeight,
+      glazingBrush,
+      applyGlazingTo,
+      cellsOfSameMaterial,
+      // Empty-canvas back-out reads the selection (deselect vs. show overall dimensions);
+      // a stale closure would misread whether cells are selected.
+      selectedCells,
       // Export tool: a stale closure (exportSelectMode === false) would never start the
       // selection marquee after arming Export.
       exportSelectMode,
+      // WHOLE-SHAPE grips. Selecting the shape changes NOTHING else this handler reads —
+      // not the perimeter, not the viewport — so without these the callback kept the
+      // closure from before the selection, where the bounds were still null. The grip
+      // test was skipped entirely and a press on a corner fell through to the body test,
+      // MOVING the building instead of resizing it. It appeared to fix itself after the
+      // first drag, because that finally changed `perimeter` and rebuilt the closure.
+      selectedPerimeterBounds,
+      hitShapeHandleAt,
     ],
   );
 
@@ -3097,6 +4108,56 @@ export default function PolylineTool() {
         return;
       }
 
+      // REFERENCE IMAGE drags. Both use the RAW model point (no draw snap): an underlay
+      // is positioned by eye against the drawing, and snapping it to the vertex grid
+      // would fight that rather than help.
+      if (drag?.kind === "imageMove") {
+        const mu = toModel(viewport, sx, sy);
+        flushHistory(); // first actual movement is what creates the undo step
+        setReferenceImages((prev) =>
+          prev.map((i) => (i.id === drag.id ? { ...i, x: mu.x - drag.grabDX, y: mu.y - drag.grabDY } : i)),
+        );
+        return;
+      }
+      // WHOLE-SHAPE MOVE. Translating by the cursor DELTA (rather than re-placing a
+      // corner) keeps the grab point under the pointer wherever it was picked up.
+      if (drag?.kind === "shapeMove") {
+        const mu = toModel(viewport, sx, sy);
+        const dx = mu.x - drag.grabX;
+        const dy = mu.y - drag.grabY;
+        if (dx !== 0 || dy !== 0) {
+          flushHistory(); // first actual movement is what creates the undo step
+          drag.grabX = mu.x;
+          drag.grabY = mu.y;
+          setPerimeter((p) => translatePerimeter(p, dx, dy));
+        }
+        return;
+      }
+      // WHOLE-SHAPE SCALE. Recomputed from the PRESS-TIME shape and bounds every frame, so
+      // the drag is a single transform re-evaluated at the current cursor — not a chain of
+      // per-frame transforms stacked on each other. Scaling the LIVE perimeter here instead
+      // compounds the factor on every pointer-move, which stretches the shape away or
+      // collapses it to a line within a few pixels of travel.
+      if (drag?.kind === "shapeScale") {
+        const mu = toModel(viewport, sx, sy);
+        flushHistory();
+        // Corners hold the shape's proportions by DEFAULT — a squashed building is
+        // nearly always a slip — with Shift as the deliberate free-stretch override.
+        // Same rule, same modifier as the underlay grips.
+        setPerimeter(scalePerimeter(drag.base, drag.from, drag.handle, mu, !e.shiftKey));
+        return;
+      }
+      if (drag?.kind === "imageResize") {
+        const mu = toModel(viewport, sx, sy);
+        flushHistory();
+        setReferenceImages((prev) =>
+          // Corner drags hold the source aspect by DEFAULT — a stretched site plan is
+          // almost always an accident — with Shift as the deliberate free-stretch.
+          prev.map((i) => (i.id === drag.id ? resizeImage(i, drag.handle, mu, !e.shiftKey) : i)),
+        );
+        return;
+      }
+
       // Export marquee drag: grow the selection rectangle to the cursor and live-
       // update which panels it intersects. Raw model point (no draw snap/constrain).
       if (drag?.kind === "marquee") {
@@ -3117,7 +4178,11 @@ export default function PolylineTool() {
         setCursorModel(mu);
         const seg = unravelResult?.segments.find((s) => s.index === drag.edge);
         if (seg) {
-          const axis = divideDraft?.axis ?? (shiftHeld ? "h" : "v");
+          // Pinned to the axis captured at press time; the fallback only matters if a
+          // draft somehow went missing mid-drag.
+          const axis =
+            divideDraft?.axis ??
+            divideAxisAt(mu, Math.min(seg.x0, seg.x1), Math.max(seg.x0, seg.x1), effectiveHeight(drag.edge));
           if (axis === "h") {
             const panelH = effectiveHeight(drag.edge);
             // Floor plates crossing the panel act as guides the rows snap to.
@@ -3160,6 +4225,42 @@ export default function PolylineTool() {
         setCursorModel(mu);
         const offset = cellInsetForPoint(mu, drag.cell, drag.side);
         setCellFrameDraft({ edge: drag.edge, cellIndex: drag.cellIndex, side: drag.side, offset, all: drag.all });
+        return;
+      }
+
+      // CELL PAINT drag (Wall Border phase): as the cursor sweeps across the focused
+      // panel's grid, ADD each new cell it enters to the selection so the user can
+      // "paint"-select a group. Entering a cell beyond the pressed one promotes the press
+      // to a drag (moved=true) and replaces the prior selection with the fresh painted set
+      // (which always includes the pressed cell). Re-entering an already-painted cell is a
+      // no-op (deduped via `keys`). We SAMPLE model points along the path from the last
+      // cursor position to this one (like the eraser) so a fast flick never skips a cell.
+      if (drag?.kind === "cellpaint") {
+        const mu = toModel(viewport, sx, sy);
+        setCursorModel(mu);
+        const cells = cellsForEdge(drag.edge);
+        // Step count from the pixel distance travelled — ~one sample every few px keeps
+        // even a fast drag inside every cell it crosses. At least 1 step (this point).
+        const distPx = Math.hypot((mu.x - drag.last.x) * viewport.scale, (mu.y - drag.last.y) * viewport.scale);
+        const steps = Math.max(1, Math.ceil(distPx / 6));
+        let changed = false;
+        for (let i = 1; i <= steps; i++) {
+          const t = i / steps;
+          const px = drag.last.x + (mu.x - drag.last.x) * t;
+          const py = drag.last.y + (mu.y - drag.last.y) * t;
+          const cell = cells.find((c) => px >= c.x0 && px <= c.x1 && py >= c.y0 && py <= c.y1);
+          if (!cell) continue;
+          const key = cellPosKey(drag.edge, cell);
+          if (drag.keys.has(key)) continue;
+          drag.keys.add(key);
+          drag.painted.push({ edge: drag.edge, x0: cell.x0, x1: cell.x1, y0: cell.y0, y1: cell.y1 });
+          changed = true;
+        }
+        drag.last = { x: mu.x, y: mu.y };
+        if (changed) {
+          drag.moved = true;
+          setSelectedCells(drag.painted.map((c) => ({ ...c })));
+        }
         return;
       }
 
@@ -3316,7 +4417,7 @@ export default function PolylineTool() {
         }
         // SUBTRACTIVE tool armed: instead of the hover-link, recommend an equal split.
         // We store the raw cursor model point (NO grid snap) whenever it's inside the
-        // selected panel; the render builder picks the AXIS by `shiftHeld` (equal-width
+        // selected panel; the render builder picks the AXIS by `divideAxisAt` (equal-width
         // columns from .x, or equal-height rows from .y) and turns it into the division
         // lines + the spacing dimension. Clears the rectangle hover-link so they don't fight.
         if (subtractiveOn && focusedPanel !== null) {
@@ -3375,6 +4476,36 @@ export default function PolylineTool() {
       // read-only unravel view). The Erase tool lights the hovered vertex (drawn red)
       // for deletion; failing a vertex it lights the hovered EDGE of a closed loop
       // (also red) — a click there removes that segment, reopening the perimeter.
+      // Reference-image grip hover: highlights the grip and sets the resize cursor, so
+      // the pointer states what a drag will do before it starts. Only while the SELECT
+      // tool holds an unlocked underlay — the one situation where grips are drawn.
+      if (selectMode && !unravelOn && selectedImage && !selectedImage.locked) {
+        setHoveredImageHandle(hitImageHandleAt(selectedImage, sx, sy));
+      } else if (hoveredImageHandle !== null) {
+        setHoveredImageHandle(null);
+      }
+      // Same for the WHOLE-SHAPE frame's grips, so both selections advertise their
+      // targets identically.
+      if (selectMode && !unravelOn && selectedPerimeterBounds) {
+        setHoveredPerimeterHandle(hitShapeHandleAt(selectedPerimeterBounds, sx, sy));
+      } else if (hoveredPerimeterHandle !== null) {
+        setHoveredPerimeterHandle(null);
+      }
+      // Over the BODY of a movable underlay, advertise the move cursor.
+      if (selectMode && !unravelOn) {
+        const over = referenceImages.some((i) => !i.locked && hitImageBody(i, m));
+        if (over !== overImageBody) setOverImageBody(over);
+        const onShape =
+          perimeter.vertices.length > 0 &&
+          hitPerimeterBody(perimeter, m, pixelsToModel(viewport, HIT_TOLERANCE_PX));
+        if (onShape !== overShapeBody) setOverShapeBody(onShape);
+      } else {
+        // Both flags have to be dropped when Select is put down or the phase changes —
+        // clearing only the image one left the move cursor stuck on after leaving Plan.
+        if (overImageBody) setOverImageBody(false);
+        if (overShapeBody) setOverShapeBody(false);
+      }
+
       if (!unravelOn && (mode === "edit" || eraserOn)) {
         const tolModel = pixelsToModel(viewport, HIT_TOLERANCE_PX);
         const vi = hitVertex(perimeter, m, tolModel);
@@ -3439,6 +4570,20 @@ export default function PolylineTool() {
       cellInsetForPoint,
       // Export marquee drag recomputes the selected panels live as the box grows.
       panelsInMarquee,
+      // Underlay move/resize + grip/body hover read these.
+      selectMode,
+      referenceImages,
+      selectedImage,
+      hoveredImageHandle,
+      overImageBody,
+      // The whole-shape hover + drag read these; without them the handler would keep a
+      // stale closure and the frame would stop responding after the first render.
+      overShapeBody,
+      selectedPerimeterBounds,
+      hitShapeHandleAt,
+      hoveredPerimeterHandle,
+      hitImageHandleAt,
+      flushHistory,
     ],
   );
 
@@ -3464,6 +4609,25 @@ export default function PolylineTool() {
           setExportPopup(sel);
           setExportSelectMode(false); // tool's job is done; disarm like a one-shot
         }
+        return;
+      }
+      // Cell STROKE release — where a glazing stroke actually commits.
+      //   • BRUSH LOADED: assign the stroke's type to every cell it swept, as ONE undo step,
+      //     then drop the highlight. The hatch that replaces it is the feedback, so keeping
+      //     the blue would only obscure the result the user just made. Deliberately deferred
+      //     to release rather than painted per-cell during the drag: a stroke is one edit,
+      //     so it must undo as one, and mid-drag writes would flood the history stack.
+      //   • NO BRUSH: a real drag already built the selection live; a press with NO drag is a
+      //     plain CLICK, so apply the single-cell TOGGLE (select it, or deselect if it was
+      //     already selected).
+      if (drag?.kind === "cellpaint") {
+        dragRef.current = null;
+        if (drag.brush !== null) {
+          applyGlazingTo(drag.brush, drag.painted);
+          setSelectedCells([]);
+          return;
+        }
+        if (!drag.moved) selectCellAt(drag.edge, drag.downCell, false);
         return;
       }
       // A plain click in Arc mode (no handle pulled) auto-curves the segment
@@ -3555,18 +4719,49 @@ export default function PolylineTool() {
       setActiveDrawHandle(-1);
     },
     [curveType, unravelResult, divideDraft, commitDivisions, commitDividersH, commitEraseLines, mullionDraft, cellFrameDraft, cellShapeColors, cellsForEdge, flushHistory, recordHistory,
+      // Cell-stroke release: commits the glazing paint, or falls back to the single-cell
+      // toggle on a no-drag click when no brush was loaded.
+      selectCellAt,
+      applyGlazingTo,
       // Export marquee release resolves the final corner via viewport and selects panels.
       viewport, panelsInMarquee],
   );
 
   const onDoubleClick = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      // Layer navigation is now driven by a SINGLE click (see onPointerDown), so a
-      // double-click no longer drills into the layers — the two underlying presses
-      // already advance one layer (debounced so they don't jump two). In the unravel
-      // view a double-click therefore does nothing extra; the draw/edit double-click
-      // shortcuts below apply only to the footprint views.
-      if (unravelOn) return;
+      // Layer navigation is otherwise driven by a SINGLE click (see onPointerDown) — the
+      // two underlying presses already advance one layer (debounced so they don't jump
+      // two). The ONE exception is the deepest layer:
+      //
+      // WALL BORDER -> CELLS. A double-click on a cell drills into the single-cell view.
+      // Single-click there is already spoken for by cell SELECTION (the Glazing
+      // workflow), so the drill takes the double-click — the same disambiguation design
+      // tools use for entering a group. This is the ONLY route into that view now that
+      // the top navigation tabs are gone; the "Cells" tab used to be it.
+      if (unravelOn) {
+        // While the GLAZING brush is loaded it owns the click, the way every other armed
+        // tool does — so a double-click paints twice rather than drilling in. Otherwise a
+        // stray double-click mid-stroke would dive a layer AND silently unload the brush
+        // (the deeper layer fails the tool's gate). Esc puts the brush down; then the
+        // double-click navigates again.
+        if (glazingBrush !== null) return;
+        if (focusedPanel !== null && focusedCell === null) {
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          const rect = canvas.getBoundingClientRect();
+          const mu = toModel(viewport, e.clientX - rect.left, e.clientY - rect.top);
+          const cells = cellsForEdge(focusedPanel);
+          // Only a SPLIT panel has cells to enter; an undivided one has no deeper layer.
+          if (cells.length > 1) {
+            const target = cells.find((c) => mu.x >= c.x0 && mu.x <= c.x1 && mu.y >= c.y0 && mu.y <= c.y1);
+            if (target) zoomToCell({ edge: focusedPanel, ...target });
+          }
+        }
+        return;
+      }
+      // While PAN owns the left drag, a double-click is navigation — never a
+      // close-the-perimeter / make-corner edit.
+      if (panArmed) return;
       if (drawing && perimeter.vertices.length >= 3) {
         recordHistory();
         setPerimeter((p) => closePerimeter(p));
@@ -3585,7 +4780,10 @@ export default function PolylineTool() {
         }
       }
     },
-    [drawing, mode, perimeter, viewport, eventToModel, unravelOn, recordHistory],
+    [drawing, mode, perimeter, viewport, eventToModel, unravelOn, recordHistory, panArmed,
+      // Wall Border -> Cells drill reads these — and is suppressed while a glazing brush
+      // is loaded, so the brush has to be current here.
+      glazingBrush, focusedPanel, focusedCell, cellsForEdge, zoomToCell],
   );
 
   // Smooth, trackpad-friendly zoom. Attached as a NON-PASSIVE native wheel
@@ -3596,6 +4794,12 @@ export default function PolylineTool() {
   const onWheel = useCallback(
     (e: WheelEvent) => {
       e.preventDefault();
+      // A zoom gesture during the unroll transition skips it, then applies to the
+      // elevation view the next event lands in (the transition owns the framing).
+      if (unrollFrameRef.current) {
+        skipUnrollRef.current();
+        return;
+      }
       cancelAnim(); // manual zoom interrupts any running animation
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -3652,12 +4856,24 @@ export default function PolylineTool() {
   );
 
   /**
+   * The phase the RESTING-TOOL effect last acted on. Declared HERE, rather than beside
+   * that effect further down, because `newProject` writes it too — see the effect for the
+   * full rationale.
+   */
+  const prevPhaseRef = useRef(unravelOn);
+
+  /**
    * Start a fresh, BLANK project — the clean slate a page refresh gives, minus the
    * onboarding hint. Resets the live editor document and all view/tool/navigation state
    * to their defaults and detaches from any loaded save (activeSavedId → null), while
    * KEEPING the saved projects list intact. Clears undo/redo (there's nothing to undo
    * back into the previous project) and suppresses the first-run hint, since this is a
    * deliberate "new project" action, not a cold load.
+   *
+   * It also leaves the PEN in hand. This is the same rule the app already applies on
+   * arrival (see the resting-tool effect): an empty Plan canvas has nothing to select and
+   * exactly one thing to do, so arming Select there would mean every new project began by
+   * putting a tool down before any work could start. A new project IS an arrival.
    */
   const newProject = useCallback(() => {
     cancelAnim();
@@ -3674,11 +4890,25 @@ export default function PolylineTool() {
     setPanelCwType({});
     setUnravelHeight(DEFAULT_WALL_HEIGHT_FT);
     setFloorPlates([]);
-    setLocation(emptyLocation());
+    setLocation(defaultLocation()); // a new sketch starts at the default site, not nowhere
+    setReferenceImages([]);
+    setSelectedImageId(null);
+    setHoveredImageHandle(null);
+    setPerimeterSelected(false); // a fresh document has no selection to carry over
+    setImportStatus(null);
+    // The default location is already a RESOLVED site, so the readout stays on rather
+    // than blanking — matching the app's own first-load state.
+    setGeoStatus("resolved");
+    setGeoAlternatives([]);
     setUnravelInputDraft({});
     setFocusedUnravelInput(null);
     // --- View + navigation ---
     setUnravelOn(false);
+    // Coming back from Elevations would otherwise trip the phase-change branch of the
+    // resting-tool effect, which arms Select — overriding the Pen this action just put in
+    // hand. Marking the phase as already handled is what makes New behave the same whether
+    // it is pressed from Plan or from Elevations.
+    prevPhaseRef.current = false;
     setMode("draw");
     setCurveType("line");
     setFocusedPanel(null);
@@ -3687,6 +4917,13 @@ export default function PolylineTool() {
     setActiveSavedId(null);
     setViewport(defaultViewport(sizeRef.current.w, sizeRef.current.h));
     // --- Tools / menus / transient selection ---
+    // The Pen is not a flag but the ABSENCE of one (see its button's active condition), so
+    // arming it means releasing everything that could take the click first. Pan and Select
+    // were the two that survived this reset, which is why New used to land on a blank
+    // canvas where clicking did nothing.
+    setPanMode(false);
+    disarmSelect();
+    setGlazingBrush(null);
     setSubtractiveOn(false);
     setDivideHover(null);
     setDivideDraft(null);
@@ -3703,9 +4940,7 @@ export default function PolylineTool() {
     setFloorPlateMode(false);
     setFloorLinesVisible(true);
     setCwMenuOpen(false);
-    setViewMenuOpen(false);
-    setStatsMode("none");
-    setStatsMenuOpen(false);
+    setStatsModes(["general"]);
     setSelectedVertex(-1);
     setHoveredVertex(-1);
     setHoveredCell(-1);
@@ -3721,17 +4956,21 @@ export default function PolylineTool() {
     // The empty canvas would normally re-show the onboarding hint; this action
     // explicitly suppresses it (no load-in text/arrow for a deliberate new project).
     setHintDismissed(true);
-  }, [cancelAnim]);
+  }, [cancelAnim, disarmSelect]);
 
   /** Capture the current perimeter + elevation state as a NEW saved entry. */
   const saveCurrent = useCallback(() => {
     if (!canSave(perimeter)) return; // guard empty/degenerate
     setSaved((list) => {
-      const entry = makeSavedPerimeter(perimeter, currentElevation, list, location);
-      setActiveSavedId(entry.id);
-      return [...list, entry];
+      const entry = makeSavedPerimeter(perimeter, currentElevation, list, location, referenceImages);
+      // A name typed in the Project section wins over the generated "Option N"; blank
+      // keeps the generated one so saving never blocks on naming.
+      const named = projectNameDraft.trim() ? { ...entry, name: projectNameDraft.trim() } : entry;
+      setActiveSavedId(named.id);
+      setProjectNameDraft(""); // the saved entry now owns the name
+      return [...list, named];
     });
-  }, [perimeter, currentElevation, location]);
+  }, [perimeter, currentElevation, location, referenceImages, projectNameDraft]);
 
   /** Load a saved perimeter back into the editor (replaces the live one). */
   const loadSavedEntry = useCallback(
@@ -3763,8 +5002,21 @@ export default function PolylineTool() {
       setPanelCwType({ ...(s.panelCwType ?? {}) });
       setUnravelHeight(s.unravelHeight ?? DEFAULT_WALL_HEIGHT_FT);
       setFloorPlates([...(s.floorPlates ?? [])]);
-      // Restore the entry's geo-location (blank for older saves with none).
-      setLocation(s.location ? cloneLocation(s.location) : emptyLocation());
+      // Restore the entry's geo-location (blank for older saves with none). The
+      // readout follows from the STORED site, so a loaded project shows where it is
+      // without re-resolving — and older saves, which carry an address but no resolved
+      // coordinates, correctly show nothing rather than a stale place.
+      const loc = s.location ? cloneLocation(s.location) : emptyLocation();
+      setLocation(loc);
+      setGeoStatus(loc.lat !== null && loc.lng !== null ? "resolved" : "idle");
+      setGeoAlternatives([]);
+      // Reference underlays (absent on projects saved before the feature). The decode
+      // effect picks these up and repaints once each bitmap is ready.
+      setReferenceImages(s.referenceImages ? cloneReferenceImages(s.referenceImages) : []);
+      setSelectedImageId(null);
+      setHoveredImageHandle(null);
+      setPerimeterSelected(false); // the frame belonged to the shape being replaced
+      setImportStatus(null);
       setActiveSavedId(s.id);
       // Closed shapes are most useful to edit; open polylines can keep drawing.
       setMode(s.perimeter.closed ? "edit" : "draw");
@@ -3781,14 +5033,517 @@ export default function PolylineTool() {
           const loadedHeights = { ...(s.unravelHeights ?? {}) };
           const loadedDefaultH = s.unravelHeight ?? DEFAULT_WALL_HEIGHT_FT;
           const heightOf = (seg: UnravelSegment) => loadedHeights[seg.index] ?? loadedDefaultH;
-          animateViewport(fitViewport(unravelBoundsPerimeter(res.segments, heightOf), w, h, 48));
+          animateViewport(
+            fitViewport(unravelBoundsPerimeter(res.segments, heightOf), w, h, 48, undefined, 1, canvasInsets()),
+          );
         }
       } else {
-        animateViewport(fitViewport(loaded, w, h, 64));
+        animateViewport(fitViewport(loaded, w, h, 64, undefined, 1, canvasInsets()));
       }
     },
-    [recordHistory, animateViewport, unravelOn, unravelGap],
+    [recordHistory, animateViewport, unravelOn, unravelGap, canvasInsets],
   );
+
+  // ===========================================================================
+  // GUIDED DEMO — the "Demo" button in the utility bar.
+  //
+  // It BUILDS the example project in front of the user rather than loading a finished
+  // one: draw the footprint, place the site, unroll the walls, then floor lines, system,
+  // centerlines, framing, glazing and the numbers that fall out of them. The value of a
+  // facade tool is in that sequence, and a finished file shows none of it.
+  //
+  // The script (geometry, parameters, copy) is pure data in core/demoTour.ts. What lives
+  // here is only the part that cannot: which of THIS component's setters each step calls.
+  //
+  // Rules the driver keeps:
+  //   · NOTHING IS FAKED. Every step writes the same state the matching tool writes, so
+  //     the result is a real, editable project — not a scripted picture of one.
+  //   · NOTHING IS LOST. An unsaved sketch is filed into the project list before the demo
+  //     clears the canvas (see startTour), and exiting keeps whatever has been built.
+  //   · IT NEVER ADVANCES ITSELF. Each step animates and then waits; only Next / Back /
+  //     Exit move the tour.
+  //   · IT IS INTERRUPTIBLE. Every await is followed by an `alive()` check, so exiting or
+  //     stepping away abandons an in-flight animation on the next frame.
+  // ===========================================================================
+
+  /** Which step of the demo is showing, or null when the tour is not running. */
+  const [tourStep, setTourStep] = useState<number | null>(null);
+  /**
+   * Has the Demo button been used yet THIS VISIT? Until it has, the button pulses so a
+   * first-time visitor can find the one control that explains the rest of the app; once
+   * they have clicked it, it goes quiet permanently and behaves like every other button.
+   *
+   * Kept in sessionStorage rather than localStorage: "this visit" is the tab session, so it
+   * survives a reload (a refresh is not a fresh visitor) but a new tab starts over. Reads
+   * and writes are guarded because storage throws outright in some privacy modes, and a
+   * decorative pulse must never be able to break the app.
+   */
+  const [demoSeen, setDemoSeen] = useState(() => {
+    try {
+      return sessionStorage.getItem(DEMO_SEEN_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const markDemoSeen = useCallback(() => {
+    setDemoSeen(true);
+    try {
+      sessionStorage.setItem(DEMO_SEEN_KEY, "1");
+    } catch {
+      /* storage unavailable — the pulse just returns next reload, which harms nothing */
+    }
+  }, []);
+  /**
+   * Bumped whenever a step starts, the user moves, or the tour exits. A running step
+   * script captures the value it started with and stops the moment they differ — which is
+   * what makes a multi-second animation abandonable without any per-step teardown.
+   */
+  const tourGenRef = useRef(0);
+
+  /**
+   * Capture the current document as the demo's saved project.
+   *
+   * A FIXED id (not a generated one) so re-running the demo overwrites its own entry
+   * instead of piling up copies in the user's library, and so stepping Back over the save
+   * is idempotent. The Solar Study reads a SAVED project, which is why the tour has to
+   * save at all rather than staying live-only.
+   */
+  const saveDemoProject = useCallback(() => {
+    const entry: SavedPerimeter = {
+      ...makeSavedPerimeter(perimeter, currentElevation, saved, location, referenceImages),
+      id: DEMO_SAVED_ID,
+      name: DEMO_PROJECT_NAME,
+    };
+    setSaved((list) => {
+      const i = list.findIndex((s) => s.id === DEMO_SAVED_ID);
+      if (i === -1) return [...list, entry];
+      const next = [...list];
+      next[i] = entry;
+      return next;
+    });
+    setActiveSavedId(DEMO_SAVED_ID);
+    setProjectNameDraft(""); // the saved entry owns the name now
+  }, [perimeter, currentElevation, saved, location, referenceImages]);
+
+  /**
+   * The values and callbacks a step script reads AFTER awaiting a frame — by which time
+   * the closure it started in is stale. Rewritten every render (the same pattern as
+   * `docRef`), so the ref always hands back the current one.
+   */
+  const tourLiveRef = useRef<{
+    unravelOn: boolean;
+    segments: UnravelSegment[];
+    cellsForEdge: (edge: number) => { x0: number; x1: number; y0: number; y1: number }[];
+    zoomToPanel: (edge: number) => void;
+    selectCwType: (t: CwType) => void;
+    saveDemoProject: () => void;
+    fitUnravel: (gap: number, heights: Record<number, number>, defaultHeight: number) => void;
+    panelsInMarquee: (rect: { x0: number; y0: number; x1: number; y1: number }) => Set<number>;
+  }>(null!);
+  tourLiveRef.current = {
+    unravelOn,
+    segments: unravelResult?.segments ?? [],
+    cellsForEdge,
+    zoomToPanel,
+    selectCwType,
+    saveDemoProject,
+    fitUnravel,
+    panelsInMarquee,
+  };
+
+  /**
+   * Run one step's state changes. Held in a ref and keyed by step id, so the effect below
+   * can depend on the step INDEX alone — it never needs this function's identity, which
+   * changes on every render because the setters it drives do.
+   *
+   * `alive()` is false once the step has been superseded; every await is followed by a
+   * check, and a false result returns immediately, leaving the document exactly as far as
+   * it got. That is safe because each step's writes are independent and idempotent.
+   */
+  const runTourStepRef = useRef<(id: string, alive: () => boolean) => Promise<void>>(async () => {});
+  runTourStepRef.current = async (id, alive) => {
+    /** Sleep, then report whether the step is still the current one. */
+    const sleep = async (ms: number) => {
+      await new Promise<void>((r) => setTimeout(r, ms));
+      return alive();
+    };
+    /** Let React commit pending state so the live ref and derived memos catch up. */
+    const settle = async () => {
+      await new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+      return alive();
+    };
+    /** Drive `onFrame(0…1)` over `ms`, stopping early if the step is superseded. */
+    const animate = (ms: number, onFrame: (t: number) => void) =>
+      new Promise<void>((resolve) => {
+        const started = performance.now();
+        const frame = (now: number) => {
+          if (!alive()) return resolve();
+          const t = Math.min(1, (now - started) / ms);
+          onFrame(t);
+          if (t >= 1) resolve();
+          else requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
+      });
+
+    switch (id) {
+      // --- 1. Draw the footprint, the way the Pen tool does -------------------
+      case "footprint": {
+        // Reachable by stepping BACK from a later card, which may leave the app in the
+        // Elevations phase — where the footprint is not drawn at all, so the whole
+        // animation would play off-screen. Fold to the plan first and let the transition
+        // finish before anything is drawn.
+        if (tourLiveRef.current.unravelOn) {
+          toggleUnrollViewRef.current();
+          if (!(await sleep(unrollDurationMs(canvasRef.current) + 120))) return;
+        }
+        setPerimeter(emptyPerimeter());
+        setMode("draw");
+        setUnravelHeight(DEMO_WALL_HEIGHT_FT);
+        // Frame the FINISHED shape before a single vertex lands, so the outline grows
+        // into a stable view instead of the camera chasing it.
+        const { w, h } = sizeRef.current;
+        setViewport(fitViewport(DEMO_PERIMETER, w, h, 96, undefined, 1, canvasInsets()));
+        if (!(await sleep(260))) return;
+        await animate(2100, (t) => setPerimeter(demoDrawFrame(DEMO_PERIMETER, t)));
+        if (!alive()) return;
+        setPerimeter(DEMO_PERIMETER); // land exactly on the authored geometry
+        setMode("edit");
+        return;
+      }
+
+      // --- 2. Resolve a real site, then open the Solar Study ------------------
+      case "site": {
+        setLocation((l) => ({ ...l, address: "" }));
+        setGeoStatus("idle");
+        if (!(await sleep(260))) return;
+        // Typed a character at a time: the Location field is a real control, and watching
+        // it fill in is what makes the resolution that follows read as the app working
+        // rather than a value appearing from nowhere.
+        for (let i = 1; i <= DEMO_ADDRESS.length; i++) {
+          setLocation((l) => ({ ...l, address: DEMO_ADDRESS.slice(0, i) }));
+          if (!(await sleep(45))) return;
+        }
+        await commitAddress(DEMO_ADDRESS);
+        if (!(await settle())) return;
+        tourLiveRef.current.saveDemoProject();
+        if (!(await settle())) return;
+        setSolarStudyId(DEMO_SAVED_ID);
+        return;
+      }
+
+      // --- 3. Unroll into the elevation strip ---------------------------------
+      case "elevations": {
+        setSolarStudyId(null);
+        if (!(await settle())) return;
+        // Guard on the CURRENT phase: stepping Back into this card from Floor Lines must
+        // re-frame the strip, not fold the building back up.
+        if (!tourLiveRef.current.unravelOn) toggleUnrollViewRef.current();
+        // Wait out the unroll transition so the strip is settled before the next step
+        // starts measuring panels off it.
+        if (!(await sleep(unrollDurationMs(canvasRef.current) + 200))) return;
+        return;
+      }
+
+      // --- 4. Floor lines, one level at a time --------------------------------
+      case "floors": {
+        setFloorLinesVisible(true);
+        // Entering Elevations arms Select (the resting tool). Release it before arming
+        // Floor Lines, or two buttons in the bar would be lit and neither would be
+        // telling the truth about what a click does. Nothing re-arms Select until the
+        // Statistics step, so this one release covers the whole cluster walkthrough.
+        disarmSelect();
+        setFloorPlateMode(true);
+        if (!(await sleep(240))) return;
+        for (const level of demoFloorLevels(DEMO_WALL_HEIGHT_FT, DEMO_FLOOR_TO_FLOOR_FT)) {
+          setFloorPlates((plates) =>
+            plates.some((p) => Math.abs(p - level) <= 1e-6)
+              ? plates
+              : [...plates, level].sort((a, b) => a - b),
+          );
+          if (!(await sleep(150))) return;
+        }
+        return;
+      }
+
+      // --- 5. Pick the curtain-wall system for the south wall -----------------
+      case "cwtype": {
+        setFloorPlateMode(false);
+        tourLiveRef.current.zoomToPanel(DEMO_FOCUS_EDGE);
+        if (!(await sleep(620))) return;
+        setCwMenuOpen(true); // show the chooser before something is picked out of it
+        if (!(await sleep(820))) return;
+        tourLiveRef.current.selectCwType("stick");
+        if (!(await settle())) return;
+        // The tool assigns the focused border; the rest of the facade gets the same
+        // system so the framing and the cost estimate below cover the whole building.
+        const segs = tourLiveRef.current.segments;
+        setPanelCwType((prev) => {
+          const next = { ...prev };
+          for (const s of segs) next[s.index] = "stick";
+          return next;
+        });
+        return;
+      }
+
+      // --- 6. Divide the wall into its curtain-wall grid ----------------------
+      case "centerlines": {
+        setCwMenuOpen(false);
+        setCenterlinesVisible(true);
+        setSubtractiveOn(true);
+        if (!(await sleep(220))) return;
+        const segs = tourLiveRef.current.segments;
+        const focus = segs.find((s) => s.index === DEMO_FOCUS_EDGE);
+        const rows = demoRowOffsets(DEMO_WALL_HEIGHT_FT, DEMO_FLOOR_TO_FLOOR_FT, DEMO_SPANDREL_BAND_FT);
+        if (focus) {
+          // Start from a BARE panel. Replaying this card (Back) would otherwise append a
+          // second copy of every offset: the grid would look identical, because
+          // cellsForEdge dedupes coincident lines, but the document would carry duplicate
+          // centerlines that the Delete tool would then find two of.
+          setPanelDivisions((prev) => ({ ...prev, [DEMO_FOCUS_EDGE]: [] }));
+          setPanelDividersH((prev) => ({ ...prev, [DEMO_FOCUS_EDGE]: [] }));
+          if (!(await sleep(120))) return;
+          // Columns then rows, drawn in one at a time on the wall being looked at.
+          for (const off of demoColumnOffsets(Math.abs(focus.x1 - focus.x0), DEMO_MODULE_FT)) {
+            setPanelDivisions((prev) => ({ ...prev, [DEMO_FOCUS_EDGE]: [...(prev[DEMO_FOCUS_EDGE] ?? []), off] }));
+            if (!(await sleep(60))) return;
+          }
+          if (!(await sleep(200))) return;
+          for (const off of rows) {
+            setPanelDividersH((prev) => ({ ...prev, [DEMO_FOCUS_EDGE]: [...(prev[DEMO_FOCUS_EDGE] ?? []), off] }));
+            if (!(await sleep(60))) return;
+          }
+          if (!(await sleep(260))) return;
+        }
+        // Every other border at once — each with the module count its OWN width calls for.
+        setPanelDivisions((prev) => {
+          const next = { ...prev };
+          for (const s of segs) next[s.index] = demoColumnOffsets(Math.abs(s.x1 - s.x0), DEMO_MODULE_FT);
+          return next;
+        });
+        setPanelDividersH((prev) => {
+          const next = { ...prev };
+          for (const s of segs) next[s.index] = [...rows];
+          return next;
+        });
+        return;
+      }
+
+      // --- 7. Grow the mullion face offset out of the centerlines -------------
+      case "framing": {
+        setSubtractiveOn(false);
+        setFramingVisible(true);
+        setMullionsOn(true);
+        if (!(await sleep(240))) return;
+        const FRAMES = 14;
+        for (let i = 1; i <= FRAMES; i++) {
+          const v = (DEMO_MULLION_OFFSET_FT * i) / FRAMES;
+          setPanelMullionsV((prev) => ({ ...prev, [DEMO_FOCUS_EDGE]: v }));
+          setPanelMullionsH((prev) => ({ ...prev, [DEMO_FOCUS_EDGE]: v }));
+          if (!(await sleep(35))) return;
+        }
+        if (!(await sleep(240))) return;
+        const segs = tourLiveRef.current.segments;
+        const applyAll = (prev: Record<number, number>) => {
+          const next = { ...prev };
+          for (const s of segs) next[s.index] = DEMO_MULLION_OFFSET_FT;
+          return next;
+        };
+        setPanelMullionsV(applyAll);
+        setPanelMullionsH(applyAll);
+        return;
+      }
+
+      // --- 8. Paint the glass, one material at a time -------------------------
+      case "glazing": {
+        setMullionsOn(false);
+        setTypeVisible(true);
+        setTypeOn(true); // open the chooser so the material is picked, not conjured
+        if (!(await sleep(760))) return;
+        setTypeOn(false);
+
+        const segs = tourLiveRef.current.segments;
+        const height = DEMO_WALL_HEIGHT_FT;
+        /** Cells of `edge` whose band classification matches `want`, in grid order. */
+        const cellsOfType = (edge: number, want: "vision" | "spandrel") => {
+          const out: number[] = [];
+          tourLiveRef.current.cellsForEdge(edge).forEach((c, i) => {
+            if (demoCellType(c.y0, c.y1, height, DEMO_FLOOR_TO_FLOOR_FT, DEMO_SPANDREL_BAND_FT) === want)
+              out.push(i);
+          });
+          return out;
+        };
+
+        // One MATERIAL at a time on the focused wall — vision first, then the brush is
+        // visibly swapped and the spandrel bands go on. Each pass sweeps the panel in grid
+        // order (column by column, left to right), which is how a drag across cells reads.
+        // Every other wall follows in one pass once the pattern has been established.
+        for (const material of ["vision", "spandrel"] as const) {
+          setGlazingBrush(material);
+          if (!(await sleep(320))) return;
+          const indices = cellsOfType(DEMO_FOCUS_EDGE, material);
+          const BATCH = Math.max(1, Math.ceil(indices.length / 12));
+          for (let i = 0; i < indices.length; i += BATCH) {
+            const batch = indices.slice(i, i + BATCH);
+            setPanelCellTypes((prev) => {
+              const panel = { ...(prev[DEMO_FOCUS_EDGE] ?? {}) };
+              for (const idx of batch) panel[idx] = material;
+              return { ...prev, [DEMO_FOCUS_EDGE]: panel };
+            });
+            if (!(await sleep(55))) return;
+          }
+        }
+        if (!(await sleep(260))) return;
+        setPanelCellTypes((prev) => {
+          const next = { ...prev };
+          for (const s of segs) {
+            if (s.index === DEMO_FOCUS_EDGE) continue;
+            const panel: Record<number, CellType> = {};
+            tourLiveRef.current.cellsForEdge(s.index).forEach((c, i) => {
+              panel[i] = demoCellType(c.y0, c.y1, height, DEMO_FLOOR_TO_FLOOR_FT, DEMO_SPANDREL_BAND_FT);
+            });
+            next[s.index] = panel;
+          }
+          return next;
+        });
+        return;
+      }
+
+      // --- 9. The same drawing, read several ways -----------------------------
+      case "viewmodes": {
+        // Put the brush down first: the view modes are a READ, and leaving a paint tool
+        // armed under them would say a click still assigns glass.
+        setGlazingBrush(null);
+        setTypeOn(false);
+        armSelectDefault();
+        // Pull back to the whole strip — Material ID and Orientation are both comparisons
+        // ACROSS walls, which one zoomed-in border cannot show.
+        tourLiveRef.current.fitUnravel(unravelGap, {}, DEMO_WALL_HEIGHT_FT);
+        if (!(await sleep(520))) return;
+        for (const mode of DEMO_VIEW_MODE_SEQUENCE) {
+          selectViewMode(mode);
+          if (!(await sleep(1150))) return;
+        }
+        return;
+      }
+
+      // --- 10. Read the building back off the drawing -------------------------
+      case "statistics": {
+        setGlazingBrush(null);
+        setTypeOn(false);
+        armSelectDefault();
+        selectViewMode("normal"); // stepping Back could have left another mode on
+        setStatsModes(["general", "wwr", "cost"]);
+        setFrontWin("stats");
+        if (!(await settle())) return;
+        // Pull back to the whole strip: the readings are about the building, and the
+        // focused border stays set so the per-wall reads still name one.
+        // No per-panel height overrides exist in the demo — every wall is the default.
+        tourLiveRef.current.fitUnravel(unravelGap, {}, DEMO_WALL_HEIGHT_FT);
+        return;
+      }
+
+      // --- 11. Select walls with the marquee and open the export dialog -------
+      //
+      // It OPENS the dialog and stops there. Nothing is downloaded: the three target
+      // buttons are left for the user to press, because a demo that writes a file to
+      // someone's disk without being asked is not a demo.
+      case "export": {
+        setExportPopup(null); // a replay starts from no dialog, so the sweep is visible
+        closeAllMenus();
+        disarmSelect();
+        setExportSelectMode(true);
+        if (!(await sleep(420))) return;
+
+        const run = demoExportWindow(tourLiveRef.current.segments, DEMO_FOCUS_EDGE, DEMO_EXPORT_PANEL_COUNT);
+        if (run.length === 0) return;
+        const pad = DEMO_MARQUEE_PAD_FT;
+        const from = run[0].x0 - pad;
+        const to = run[run.length - 1].x1 + pad;
+        const box = (x1: number) => ({ x0: from, y0: -pad, x1, y1: DEMO_WALL_HEIGHT_FT + pad });
+
+        // Sweep the box across the run, updating the live selection as it goes — the same
+        // thing the drag handler does on every pointer move.
+        await animate(900, (t) => {
+          const rect = box(from + (to - from) * t);
+          setMarquee(rect);
+          setExportSelection(tourLiveRef.current.panelsInMarquee(rect));
+        });
+        if (!alive()) return;
+
+        // Release: the box goes, the selection stays, the dialog opens, and the tool
+        // disarms — a marquee is a one-shot (mirrors the pointer-up handler).
+        const selection = tourLiveRef.current.panelsInMarquee(box(to));
+        setMarquee(null);
+        setExportSelection(selection);
+        setExportSelectMode(false);
+        if (selection.size === 0) return;
+        if (!(await sleep(320))) return;
+        setExportPopup(selection);
+        return;
+      }
+
+      // --- 12. Nothing to do but hand the project over ------------------------
+      case "done": {
+        // Clear the export dialog and its green highlight so the last card shows the
+        // finished building rather than a leftover selection.
+        setExportPopup(null);
+        setExportSelection(new Set());
+        armSelectDefault();
+        return;
+      }
+    }
+  };
+
+  // Run the current step. Keyed on the INDEX alone, so Back replays a step exactly as
+  // Next played it; the cleanup bumps the generation, which is what stops an in-flight
+  // animation the moment the user moves or exits.
+  useEffect(() => {
+    if (tourStep === null) return;
+    const gen = ++tourGenRef.current;
+    void runTourStepRef.current(TOUR_STEPS[tourStep].id, () => tourGenRef.current === gen);
+    return () => {
+      tourGenRef.current++;
+    };
+  }, [tourStep]);
+
+  /**
+   * Start the demo. An unsaved sketch is FILED FIRST — the demo clears the canvas to draw
+   * its own building, and a button labelled "Demo" must not be able to cost the user work
+   * they have not saved. Anything already saved is untouched either way.
+   */
+  const startTour = useCallback(() => {
+    if (activeSavedId === null && canSave(perimeter)) saveCurrent();
+    setHelpPanel(null);
+    setHelpMenuOpen(false);
+    setExportPopup(null);
+    setSolarStudyId(null);
+    newProject();
+    setTourStep(0);
+  }, [activeSavedId, perimeter, saveCurrent, newProject]);
+
+  /**
+   * Leave the demo, keeping everything it has built so far. The two dialogs the tour
+   * OPENS are closed with it — they were the tour talking, not something the user asked
+   * for — along with the marquee state, so the canvas is handed back clean.
+   */
+  const exitTour = useCallback(() => {
+    tourGenRef.current++; // abandon any in-flight step animation on its next frame
+    setTourStep(null);
+    setSolarStudyId(null);
+    setExportPopup(null);
+    setExportSelectMode(false);
+    setMarquee(null);
+    setExportSelection(new Set());
+  }, []);
+
+  const nextTourStep = useCallback(() => {
+    setTourStep((s) => (s === null || s + 1 >= TOUR_STEPS.length ? null : s + 1));
+  }, []);
+
+  const backTourStep = useCallback(() => {
+    setTourStep((s) => (s === null || s === 0 ? s : s - 1));
+  }, []);
 
   const deleteSavedEntry = useCallback(
     (id: string) => {
@@ -3888,7 +5643,13 @@ export default function PolylineTool() {
       // Location is metadata, compared the same way (a blank live location matches a
       // stored entry that never had one, so loading then idling never re-writes).
       const sameLoc = JSON.stringify(cur.location ?? emptyLocation()) === JSON.stringify(location);
-      if (sameGeom && sameElev && sameLoc) return list; // already in sync — no change
+      // Reference images are compared by PLACEMENT SIGNATURE, never by stringifying the
+      // whole list: each carries a data URL of hundreds of KB, and JSON.stringify-ing
+      // those on every render would be a serious cost for no information. `src` is
+      // immutable for a given id, so id + geometry + display flags fully determine
+      // whether anything the user changed needs writing back.
+      const sameImgs = imageSignature(cur.referenceImages ?? []) === imageSignature(referenceImages);
+      if (sameGeom && sameElev && sameLoc && sameImgs) return list; // in sync — no change
 
       // ISOLATION: replace ONLY the active entry; every other entry keeps its
       // exact reference. Deep-copy the live document into the snapshot so later
@@ -3910,14 +5671,43 @@ export default function PolylineTool() {
         unravelHeight: elev.unravelHeight,
         floorPlates: elev.floorPlates,
         location: cloneLocation(location),
+        referenceImages: cloneReferenceImages(referenceImages),
       };
       return next;
     });
-  }, [activeSavedId, perimeter, unravelHeights, unravelCells, panelDivisions, panelDividersH, panelMullionsV, panelMullionsH, panelCellFraming, panelCellTypes, panelCwType, unravelHeight, floorPlates, currentElevation, location, setSaved]);
+  }, [activeSavedId, perimeter, unravelHeights, unravelCells, panelDivisions, panelDividersH, panelMullionsV, panelMullionsH, panelCellFraming, panelCellTypes, panelCwType, unravelHeight, floorPlates, currentElevation, location, referenceImages, setSaved]);
 
-  // Persist whenever the saved list changes (keeps localStorage in sync).
+  /**
+   * AUTO-CREATE the project the moment the perimeter CLOSES.
+   *
+   * Previously the sketch stayed unsaved until the user found "Save" in the Projects
+   * popup, and everything downstream was gated behind that — so drawing a footprint and
+   * reaching for the next step led to a disabled control with no explanation of why.
+   * Closing the shape is the natural commit point: the footprint is complete, so the
+   * project exists. The Save button still works for deliberately spinning off new options.
+   *
+   * Fires on the open -> closed EDGE, not merely on "is closed". That matters: deleting
+   * the active project clears `activeSavedId` while the perimeter stays closed, and a
+   * condition-based check would instantly recreate the project the user just deleted.
+   */
+  const prevClosedRef = useRef(perimeter.closed);
   useEffect(() => {
-    persistSaved(saved);
+    const wasClosed = prevClosedRef.current;
+    prevClosedRef.current = perimeter.closed;
+    // Suppressed during the guided demo: the tour closes a perimeter of its own and then
+    // saves it under a FIXED id two steps later (see saveDemoProject), so letting this
+    // fire would file a stray "Option N" copy of the same building first.
+    if (tourStep !== null) return;
+    if (!wasClosed && perimeter.closed && activeSavedId === null && canSave(perimeter)) {
+      saveCurrent();
+    }
+  }, [perimeter, activeSavedId, saveCurrent, tourStep]);
+
+  // Persist whenever the saved list changes (keeps localStorage in sync). The result
+  // is checked because reference images make the few-MB quota genuinely reachable, and
+  // a save that silently stops working would cost the user their session.
+  useEffect(() => {
+    setSaveFailed(!persistSaved(saved));
   }, [saved]);
 
   // ---------------------------------------------------------------------------
@@ -3926,6 +5716,18 @@ export default function PolylineTool() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // UNROLL TRANSITION: ANY key skips it (Escape included) and is otherwise
+      // swallowed — a shortcut aimed at the footprint must not fire in the elevation
+      // view the transition is still on its way to. Modifiers alone are ignored so
+      // holding Ctrl/Shift ahead of a shortcut doesn't cut the transition short.
+      if (unrollFrameRef.current) {
+        if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
+          e.preventDefault();
+          skipUnrollRef.current();
+        }
+        return;
+      }
+
       if (e.key === "Shift") setShiftHeld(true);
 
       // While the help popup is open it owns Escape (its own effect closes it);
@@ -3937,6 +5739,27 @@ export default function PolylineTool() {
       // Ignore shortcuts while typing in a form field.
       const tag = (e.target as HTMLElement)?.tagName;
       const typing = tag === "INPUT" || tag === "TEXTAREA";
+
+      // HELP — "?" or F1 opens the reference chooser (Controls / Statistics / View modes).
+      // The Help BUTTON was removed from the utility bar, so this keystroke is now the way
+      // in; Escape (handled while open) closes it. Skipped while typing, where "?" is text.
+      if ((e.key === "?" || e.key === "F1") && !typing) {
+        e.preventDefault();
+        if (helpOpen) closeHelp();
+        else setHelpMenuOpen(true);
+        return;
+      }
+
+      // SPACE = hold-to-PAN (Rhino / Illustrator / Figma convention). While held, a left
+      // drag on the canvas moves the view; releasing returns to the tool that was armed
+      // before, so it never changes the Pan button's own toggle. preventDefault stops the
+      // page from scrolling AND stops Space from re-clicking whatever button has focus.
+      // Skipped while typing — a space belongs to the text field.
+      if (e.code === "Space" && !typing) {
+        e.preventDefault();
+        setSpaceHeld(true);
+        return;
+      }
 
       // Ctrl/Cmd+S — save the current perimeter (prevent the browser save dialog).
       if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {
@@ -4032,6 +5855,15 @@ export default function PolylineTool() {
       }
 
       // Curve-type shortcuts: A = arc, L = line (for segments drawn next).
+      // V — arm Select, the near-universal shortcut for the pointer tool. Arms rather
+      // than toggles: pressing it twice should leave you with the tool, not without it.
+      // Going through onSelect (not armSelectDefault) is what makes V a real ESCAPE from
+      // whatever is in hand: it puts every other tool down, including unloading the
+      // Glazing brush, so the bar can never be left showing two armed tools.
+      if (!typing && (e.key === "v" || e.key === "V")) {
+        if (!selectMode) onSelect();
+        return;
+      }
       if (!typing && (e.key === "a" || e.key === "A")) {
         setCurveType("arc");
         return;
@@ -4059,30 +5891,39 @@ export default function PolylineTool() {
           (document.activeElement as HTMLElement)?.blur?.();
           return;
         }
-        // Esc closes the Settings popup first of all, then the Statistics menu, the
-        // View menu, the Floor Lines menu, the CW Type menu, disarms the Mullions tool, and so on.
-        if (settingsOpen) {
-          setSettingsOpen(false);
-          (document.activeElement as HTMLElement)?.blur?.();
-          return;
-        }
-        if (statsMenuOpen) {
-          setStatsMenuOpen(false);
-          (document.activeElement as HTMLElement)?.blur?.();
-          return;
-        }
-        if (viewMenuOpen) {
-          setViewMenuOpen(false);
-          (document.activeElement as HTMLElement)?.blur?.();
-          return;
-        }
+        // Esc closes the Statistics menu, the View menu, the Floor Lines menu, the
+        // CW Type menu, disarms the Mullions tool, and so on.
         if (cwMenuOpen) {
           setCwMenuOpen(false);
           (document.activeElement as HTMLElement)?.blur?.();
           return;
         }
+        // Esc disarms the Pan tool first (it owns the left drag, so releasing it is the
+        // most likely intent), leaving the rest of the state — selection, zoom — alone.
+        if (panMode) {
+          setPanMode(false);
+          dragRef.current = null;
+          armSelectDefault(); // put the tool down, pick Select back up
+          (document.activeElement as HTMLElement)?.blur?.();
+          return;
+        }
+        // Esc with something SELECTED drops the selection — but Select itself stays in
+        // hand, because it is the resting tool (see armSelectDefault). Escape empties
+        // your hands; it never leaves the app with no tool at all.
+        // With nothing held, this branch does not consume the key: Escape falls through
+        // to the rest of the ladder, where it still exits a zoom or cancels a polyline.
+        if (selectMode && (selectedImageId !== null || perimeterSelected)) {
+          setSelectedImageId(null);
+          setHoveredImageHandle(null);
+          setPerimeterSelected(false);
+          setHoveredPerimeterHandle(null);
+          dragRef.current = null;
+          (document.activeElement as HTMLElement)?.blur?.();
+          return;
+        }
         if (mullionsOn) {
           setMullionsOn(false);
+          armSelectDefault(); // put the tool down, pick Select back up
           setMullionHover(null);
           setMullionDraft(null);
           setCellEdgeHover(null);
@@ -4090,9 +5931,13 @@ export default function PolylineTool() {
           (document.activeElement as HTMLElement)?.blur?.();
           return;
         }
-        // Esc disarms the (scaffolded) Type tool.
-        if (typeOn) {
+        // Esc puts the Glazing tool down — whether the chooser is open or a brush is loaded
+        // — and drops the highlight, so it never lingers as a target for the next click.
+        if (typeOn || glazingBrush !== null) {
           setTypeOn(false);
+          setGlazingBrush(null);
+          setSelectedCells([]);
+          armSelectDefault(); // put the tool down, pick Select back up
           (document.activeElement as HTMLElement)?.blur?.();
           return;
         }
@@ -4100,6 +5945,7 @@ export default function PolylineTool() {
         // keeping the panel selected so a second Esc exits the zoom.
         if (subtractiveOn) {
           setSubtractiveOn(false);
+          armSelectDefault(); // put the tool down, pick Select back up
           setDivideHover(null);
           setDivideDraft(null);
           (document.activeElement as HTMLElement)?.blur?.();
@@ -4109,6 +5955,7 @@ export default function PolylineTool() {
         // in-progress drag collection) before exiting the zoom.
         if (eraserOn) {
           setEraserOn(false);
+          armSelectDefault(); // put the tool down, pick Select back up
           setEraseHover(null);
           setEraseDragCollected([]);
           setHoveredVertex(-1); // drop the perimeter vertex delete-highlight too
@@ -4122,6 +5969,7 @@ export default function PolylineTool() {
         // Then disarms the floor-plate tool if it's active.
         if (floorPlateMode) {
           setFloorPlateMode(false);
+          armSelectDefault(); // put the tool down, pick Select back up
           (document.activeElement as HTMLElement)?.blur?.();
           return;
         }
@@ -4143,6 +5991,15 @@ export default function PolylineTool() {
           (document.activeElement as HTMLElement)?.blur?.();
           return;
         }
+        // FINALLY, from the full elevation strip, Esc folds back to the footprint —
+        // completing the back-out chain (cell -> panel -> strip -> plan). Without this
+        // last step the strip was a dead end for the keyboard, which only mattered once
+        // the top navigation tabs were removed and the toggle became the sole route.
+        if (unravelOn) {
+          toggleUnrollViewRef.current();
+          (document.activeElement as HTMLElement)?.blur?.();
+          return;
+        }
         if (drawing) {
           // Cancel the in-progress polyline.
           if (perimeter.vertices.length > 0) recordHistory();
@@ -4156,6 +6013,11 @@ export default function PolylineTool() {
           e.preventDefault();
           recordHistory();
           setPerimeter((p) => popVertex(p));
+        } else if (selectedImageId !== null) {
+          // A selected reference image takes the delete before the perimeter does —
+          // it is the thing with a visible selection, so it is what the user means.
+          e.preventDefault();
+          deleteSelectedImage();
         } else if (mode === "edit" && selectedVertex >= 0) {
           e.preventDefault();
           recordHistory();
@@ -4166,12 +6028,21 @@ export default function PolylineTool() {
     };
     const onKeyUp = (e: KeyboardEvent) => {
       if (e.key === "Shift") setShiftHeld(false);
+      // Releasing Space ends the temporary pan. Also ended by a window blur (below),
+      // so alt-tabbing mid-hold can't strand the canvas in pan mode.
+      if (e.code === "Space") setSpaceHeld(false);
+    };
+    const onBlur = () => {
+      setShiftHeld(false);
+      setSpaceHeld(false);
     };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
     };
   }, [
     drawing,
@@ -4180,11 +6051,10 @@ export default function PolylineTool() {
     selectedVertex,
     saveCurrent,
     unravelOn,
-    statsMenuOpen,
     cwMenuOpen,
-    viewMenuOpen,
     mullionsOn,
     typeOn,
+    glazingBrush,
     focusedPanel,
     focusedCell,
     unravelResult,
@@ -4197,34 +6067,35 @@ export default function PolylineTool() {
     redo,
     recordHistory,
     floorPlateMode,
+    // Esc disarms Pan first; without this the handler would test a stale panMode.
+    panMode,
+    // (Esc from the full strip folds back to the plan via toggleUnrollViewRef, which
+    // needs no dependency — a ref is always current.)
+    // Esc deselects then disarms Select, and Delete removes the selected underlay —
+    // both read these, so a stale closure would make the keys no-ops.
+    selectMode,
+    // Escape steps through: picked object → tool. Both reads must be current.
+    perimeterSelected,
+    // V arms Select through this handler; without it the key would call a stale onSelect.
+    onSelect,
+    selectedImageId,
+    disarmSelect,
+    deleteSelectedImage,
     helpOpen,
     subtractiveOn,
     eraserOn,
     dimInput,
     commitDimVertex,
-    settingsOpen,
     exportSelectMode,
     exportPopup,
   ]);
 
-  // CW-TYPE GATE for the bottom-left cluster + Eraser. Floor Lines, Centerlines,
-  // Framing, and the Eraser are only enabled once the SELECTED panel has a CW Type
-  // assigned (cwType !== null, which implies the unravel view AND a focused panel).
-  // Whenever the type is lost — deselecting the panel, leaving the unravel view, or
-  // focusing a panel with no type yet — de-arm every armed cluster tool and drop its
-  // in-flight preview so a now-disabled button is never left visually "active".
-  useEffect(() => {
-    if (cwType !== null) return;
-    setFloorPlateMode(false);
-    setSubtractiveOn(false);
-    setDivideHover(null);
-    setDivideDraft(null);
-    setMullionsOn(false);
-    setMullionDraft(null);
-    setEraserOn(false);
-    setEraseHover(null);
-    setTypeOn(false);
-  }, [cwType]);
+  // (The blanket CW-TYPE GATE that used to live here — disarming Floor Lines,
+  // Centerlines, Framing, the Eraser and Type the moment `cwType` went null — has been
+  // removed. It disarmed tools that never depended on a curtain-wall system, and every
+  // tool now has its OWN auto-disarm effect keyed to its OWN gate; see "AUTO-DISARM ON
+  // GATE LOSS" further down. Keeping this would have re-locked the very tools this
+  // change ungated.)
 
   // A typed dimension only makes sense mid-draw; drop any leftover entry as soon as
   // drawing stops (polyline closed/cancelled, switched to edit, entered unravel).
@@ -4271,7 +6142,9 @@ export default function PolylineTool() {
   }, [unravelOn, focusedPanel, focusedCell]);
 
   // Close the help popup on Escape (a predictable, obvious dismissal alongside the
-  // close button and the outside-click overlay). Bound only while it is open.
+  // × close button and the "?" toggle). Bound only while it is open. NOTE: the chosen
+  // reference panel intentionally has no outside-click dismissal so it stays open
+  // through canvas navigation — Escape / × / "?" are the only ways to close it.
   useEffect(() => {
     if (!helpOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -4333,10 +6206,20 @@ export default function PolylineTool() {
     if (!ctx) return;
     const { w, h, dpr } = sizeRef.current;
 
+    // UNROLL TRANSITION: while it runs it OWNS the canvas — the scene is mid-way
+    // between the footprint and the elevation strip, so neither 2D state describes
+    // it. Drawn here (rather than as an overlay) so any repaint triggered by other
+    // state during the run still shows the correct frame.
+    const unroll = unrollFrameRef.current;
+    if (unroll) {
+      renderUnrollFrame(ctx, canvas, w, h, dpr, unroll);
+      return;
+    }
+
     // Subtractive equal-split preview + LIVE SPACING DIMENSION. The recommendation is
     // an even split of the selected panel into N equal bays. Lines come from the active
     // drag (priority) or the hover, both via the SAME pure generators as the commit.
-    // While Shift is held the split is HORIZONTAL (equal-height ROWS, `buildEqualRows`,
+    // The cursor's quadrant picks the axis: HORIZONTAL (equal-height ROWS, `buildEqualRows`,
     // with a VERTICAL measure dimension); otherwise VERTICAL (equal-width COLUMNS,
     // `buildEqualColumns`, with a HORIZONTAL measure dimension). The `dim` measures ONE
     // bay under the cursor, so the user sees the resulting column width / row height.
@@ -4348,8 +6231,14 @@ export default function PolylineTool() {
         const hi = Math.max(draw.seg.x0, draw.seg.x1);
         const panelH = Math.max(draw.height, 0);
         const draftActive = divideDraft && divideDraft.edge === focusedPanel;
-        // HORIZONTAL (equal rows) when Shift is held OR an in-flight drag is on the H axis.
-        const horizontal = draftActive ? divideDraft!.axis === "h" : shiftHeld;
+        // HORIZONTAL (equal rows) when an in-flight drag is on the H axis, otherwise from
+        // the hovered position: the panel's diagonals decide, so the preview flips between
+        // rows and columns as the cursor crosses them — no Shift. See divideAxisAt.
+        const horizontal = draftActive
+          ? divideDraft!.axis === "h"
+          : divideHover
+            ? divideAxisAt(divideHover, lo, hi, panelH) === "h"
+            : false;
         if (horizontal) {
           // Hover gate: only recommend when the cursor is strictly INSIDE the panel
           // height (not on the baseline / top border), mirroring the column gate.
@@ -4504,11 +6393,19 @@ export default function PolylineTool() {
       // Additive / Subtractive target). The renderer draws its width label in the
       // floor-plate grey to signal the selection.
       selectedUnravelPanel: focusedPanel ?? -1,
+      // STATISTICS ANCHOR: the border the per-panel readings describe, framed in red so the
+      // numbers in the Statistics window are attributable to a wall on screen. -1 whenever
+      // no panel-scoped reading is on, so the frame appears only when it means something.
+      statsAnchorPanel,
       // PANELS phase ONLY (one panel focused, not in the deeper Assembly cell zoom):
       // tell the renderer to dimension this panel's grid per column (top) / per row
       // (left). -1 in every other phase so the per-band labels never appear in the
       // full Elevations strip, the Assembly cell zoom, or the perimeter view.
       cellDimEdge: unravelOn && focusedPanel !== null && focusedCell === null ? focusedPanel : -1,
+      // With NO cells selected, an empty-canvas click collapses the focused panel's grid to
+      // just its overall length + height (camera unchanged). Ignored while cells are selected
+      // (the per-cell readout wins) or in any other phase.
+      cellDimOverall: panelDimsOverall,
       // ASSEMBLY phase ONLY (a single cell zoomed-into): the focused cell's model
       // rect, so the renderer annotates all four of its edges with a dimension
       // label (top/bottom = width, left/right = height). null in every other phase.
@@ -4519,16 +6416,32 @@ export default function PolylineTool() {
       // ASSEMBLY phase: which of the focused cell's edges the cursor is hovering, so
       // the renderer strokes that one edge red. null when not near any edge.
       focusedCellEdge: unravelOn && focusedCell !== null ? hoveredCellEdge : null,
+      // REFERENCE IMAGES (imported underlays) — perimeter view only, where tracing
+      // happens; the elevation views are generated from the footprint, so a plan
+      // underlay has no meaning there. Paired with their decoded bitmaps (see
+      // imageBitmapsRef); `bitmapTick` is in this memo's deps so a decode that lands
+      // after the placement triggers the repaint that actually shows it.
+      referenceImages: unravelOn
+        ? []
+        : referenceImages.map((image) => ({ image, bitmap: imageBitmapsRef.current.get(image.id) ?? null })),
+      // The transform frame + grips belong to the SELECT tool, so they are drawn only
+      // while it is armed. The images themselves always draw — they are an underlay, not
+      // a selection.
+      selectedImageId: !unravelOn && selectMode ? selectedImageId : null,
+      hoveredImageHandle: !unravelOn && selectMode ? hoveredImageHandle : null,
+      // WHOLE-SHAPE selection frame — only while Select holds it, in the Plan phase.
+      selectedPerimeterBox: !unravelOn && selectMode ? selectedPerimeterBounds : null,
+      hoveredPerimeterHandle: !unravelOn && selectMode ? hoveredPerimeterHandle : null,
       floorPlates,
       // Floor Lines "Hide" — suppress drawing every floor line (and its label / eraser
-      // highlight) without deleting them. A view preference from the Floor Lines eye icon.
+      // highlight) without deleting them. A view preference from Display ▸ Visibility.
       floorPlatesHidden: !floorLinesVisible,
-      // Centerlines / Framing "Hide" — same view preference, toggled by the eye icon on
-      // each tool button; suppresses drawing those elements without deleting them.
+      // Centerlines / Framing "Hide" — same view preference, toggled from the Display ▸
+      // Visibility rows; suppresses drawing those elements without deleting them.
       centerlinesHidden: !centerlinesVisible,
       framingHidden: !framingVisible,
-      // Dim "Hide" — the Dim button (and its eye) is the single source of truth for the
-      // on-canvas dimension labels; no view auto-hides them.
+      // Dimensions "Hide" — Display ▸ Visibility ▸ Dimensions is the single source of
+      // truth for the on-canvas dimension labels; no view mode auto-hides them.
       dimensionsHidden: !dimensionsVisible,
       // Ghosted preview line follows the cursor's elevation while the tool is
       // armed, run through the SAME snap helper as placement so the ghost line
@@ -4542,7 +6455,7 @@ export default function PolylineTool() {
       eraseFloorPlates,
       // CLEAN view: white panel fill; only the DIMENSION labels are hidden. Floor lines,
       // centerlines, and framing are NEVER auto-hidden by any view — they follow only their
-      // per-button eye icons (floorPlatesHidden / centerlinesHidden / framingHidden above).
+      // Display ▸ Visibility rows (floorPlatesHidden / centerlinesHidden / framingHidden above).
       cellClean: cellViewMode === "clean",
       // SHADOWS view: clean white glass PLUS raised-frame hard drop shadows (2.5D).
       cellShadows: cellViewMode === "shadows",
@@ -4568,14 +6481,26 @@ export default function PolylineTool() {
     exportSelection,
     marquee,
     focusedPanel,
+    // Repaint when the statistics anchor moves (or appears / disappears with the readings).
+    statsAnchorPanel,
     // Per-cell hover highlight (Panels phase): repaint as the hovered cell changes.
     focusedCell,
     hoveredCell,
     // Cell selection (Wall Border phase): repaint as the selected set changes.
     selectedCells,
+    // Overall-vs-grid dimension mode (Panels phase): repaint when it toggles.
+    panelDimsOverall,
     // Assembly phase: repaint as the hovered cell EDGE changes (red highlight).
     hoveredCellEdge,
     cellsForEdge,
+    // Reference-image underlays: repaint on placement/transform, on selection, on grip
+    // hover, and on `bitmapTick` — the signal that a decode finished and there is
+    // finally something to blit.
+    referenceImages,
+    selectedImageId,
+    hoveredImageHandle,
+    selectMode,
+    bitmapTick,
     floorPlates,
     floorPlateMode,
     floorLinesVisible,
@@ -4585,8 +6510,8 @@ export default function PolylineTool() {
     // Preview elevation is now run through snapFloorPlateY (reads floorPlates /
     // shiftHeld / viewport), so repaint when the snap result can change.
     snapFloorPlateY,
-    // Subtractive division preview repaints as it changes. `shiftHeld` flips the
-    // preview AXIS (rows vs columns), so toggling Shift repaints immediately.
+    // Subtractive division preview repaints as it changes; the AXIS now comes from the
+    // hovered position (divideAxisAt), so divideHover alone drives it.
     subtractiveOn,
     divideHover,
     divideDraft,
@@ -4606,14 +6531,16 @@ export default function PolylineTool() {
     // Clean/Shadows views repaint the panels white (floor lines, centerlines, framing,
     // and dimensions follow their per-button toggles, not the view mode).
     cellViewMode,
-    // Repaint every on-canvas dimension label when the display unit changes (the
-    // renderer's formatters read the active unit from core/units at paint time).
-    unitSystem,
   ]);
 
   useEffect(() => {
     paint();
   }, [paint]);
+
+  // Always-current paint, so the unroll transition's frame loop can repaint without
+  // re-subscribing every time `paint` is rebuilt (mirrors viewportRef above).
+  const paintRef = useRef(paint);
+  paintRef.current = paint;
 
   // ---------------------------------------------------------------------------
   // DERIVED READOUTS
@@ -4621,6 +6548,31 @@ export default function PolylineTool() {
 
   /** Whether the current shape has enough edges to unravel. */
   const canUnravel = perimeter.vertices.length >= 2;
+
+  /**
+   * Is the Pen currently EDITING rather than drawing? True once the footprint is a closed,
+   * valid surface — at which point there is nothing left to draw and every click means
+   * "adjust what's there". Drives the Pen button's tooltip and the Plan-phase cursor.
+   * A closed perimeter always has >= 3 vertices (closePerimeter enforces it), so `closed`
+   * alone is the whole test for "valid surface".
+   */
+  const penEditing = perimeter.closed;
+
+  /**
+   * Keep the Pen's actual mode in step with the shape. Every path that CLOSES the
+   * perimeter already switches to edit (clicking the first vertex, double-click, Enter);
+   * this handles the reverse — erasing an edge, or dropping below three vertices, reopens
+   * the loop, and the Pen has to go back to DRAWING or its tooltip would advertise one
+   * behaviour while the canvas did the other.
+   *
+   * Fires on the closed -> open EDGE only, so it never fights a deliberate mode change.
+   */
+  const prevPenClosedRef = useRef(perimeter.closed);
+  useEffect(() => {
+    const wasClosed = prevPenClosedRef.current;
+    prevPenClosedRef.current = perimeter.closed;
+    if (wasClosed && !perimeter.closed) setMode("draw");
+  }, [perimeter.closed]);
 
   /**
    * Toggle the unravel view; on entry, clear transient edit state and fit the strip.
@@ -4660,36 +6612,205 @@ export default function PolylineTool() {
     });
   }, [fitUnravel, unravelGap, unravelHeights, unravelHeight]);
 
-  /** Give the selected vertex symmetric handles tangent to its neighbours
-   *  (corner → smooth curve), so both adjacent segments bow. */
-  const smoothSelected = () => {
-    if (selectedVertex < 0) return;
-    const v = perimeter.vertices;
-    const n = v.length;
-    if (n < 2) return;
-    const i = selectedVertex;
-    const hasPrev = i > 0 || perimeter.closed;
-    const hasNext = i < n - 1 || perimeter.closed;
-    const prev = v[(i - 1 + n) % n];
-    const next = v[(i + 1) % n];
-    const cur = v[i];
-    // Tangent direction: from prev to next (or whichever neighbour exists).
-    const from = hasPrev ? prev : cur;
-    const to = hasNext ? next : cur;
-    const dx = to.x - from.x;
-    const dy = to.y - from.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const refLen = Math.min(distance(cur, hasPrev ? prev : next), distance(cur, hasNext ? next : prev)) / 3 || 1;
-    const off = { x: (dx / len) * refLen, y: (dy / len) * refLen };
-    recordHistory();
-    setPerimeter((p) => setHandle(p, i, "out", off, true));
+  // ---------------------------------------------------------------------------
+  // UNROLL TRANSITION
+  //
+  // Entering the elevation views from the Plan phase plays the footprint
+  // standing up as a 3D massing and unrolling flat (core/unrollAnim.ts) rather than
+  // cutting straight to the strip — so the user SEES which wall came from where and
+  // in what order, which a jump throws away.
+  //
+  // The transition is pure presentation: it commits no geometry and changes no
+  // document state. Its last frame is drawn at exactly `to`, and finishing just sets
+  // that viewport and enters the view — so skipping it early (any click, key, or
+  // wheel) lands on the identical result, only sooner.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * End the transition NOW and enter the elevation views. Used both by the natural
+   * end of the run and by every skip path. `toggleUnravel(true)` suppresses the
+   * strip-fit because we already frame the strip exactly.
+   */
+  const finishUnroll = useCallback(() => {
+    const frame = unrollFrameRef.current;
+    if (!frame) return;
+    if (unrollRafRef.current !== null) {
+      cancelAnimationFrame(unrollRafRef.current);
+      unrollRafRef.current = null;
+    }
+    unrollFrameRef.current = null;
+    setViewport(frame.to);
+    toggleUnravel(true);
+  }, [toggleUnravel]);
+
+  /**
+   * End a FOLD-BACK now and settle on the footprint. The mirror of
+   * {@link finishUnroll}: the fold already left the elevation view when it started, so
+   * all that remains is to drop the frame and land on the plan framing (`from`, which
+   * is the t = 0 end of the same tween).
+   */
+  const finishFold = useCallback(() => {
+    const frame = unrollFrameRef.current;
+    if (!frame) return;
+    if (unrollRafRef.current !== null) {
+      cancelAnimationFrame(unrollRafRef.current);
+      unrollRafRef.current = null;
+    }
+    unrollFrameRef.current = null;
+    setViewport(frame.from);
+  }, []);
+
+  // Publish for the input handlers defined ABOVE this point (see unrollFrameRef). The
+  // skip must land on the END the run was actually heading for, so it dispatches on
+  // direction — skipping a fold with finishUnroll would re-enter the view being left.
+  skipUnrollRef.current = () => {
+    if (unrollDirRef.current === "fold") finishFold();
+    else finishUnroll();
   };
 
-  const cornerSelected = () => {
-    if (selectedVertex < 0) return;
-    recordHistory();
-    setPerimeter((p) => clearVertexHandles(p, selectedVertex));
-  };
+  /**
+   * Play the transition, then enter the elevation views. Falls back to entering them
+   * directly whenever there is nothing to animate — degenerate geometry, or a
+   * `--unroll-duration-ms` of 0 (the CSS opt-out) — so the destination is never
+   * gated on the animation.
+   */
+  const startUnroll = useCallback(() => {
+    const { w, h } = sizeRef.current;
+    const chain = buildUnrollChain(perimeter, unravelGap);
+    const segments = unravelPerimeter(perimeter, unravelGap).segments;
+    const duration = unrollDurationMs(canvasRef.current);
+    // Bail out to a direct entry rather than animating something that wouldn't land
+    // where it claims: degenerate geometry, a `--unroll-duration-ms` of 0 (the CSS
+    // opt-out), or a chain that disagrees with the layout it hands off to (only
+    // reachable from a malformed perimeter, e.g. one flagged closed with 2 vertices).
+    if (!chain || segments.length === 0 || chain.panels !== segments.length || duration <= 0) {
+      toggleUnravel();
+      return;
+    }
+    // Same per-panel heights and same fit the elevation view itself uses, so the
+    // final frame and the first 2D frame are the same picture.
+    const heightOf = (edge: number) => unravelHeights[edge] ?? unravelHeight;
+    const to = fitViewport(
+      unravelBoundsPerimeter(segments, (s) => heightOf(s.index)),
+      w,
+      h,
+      48,
+      undefined,
+      1,
+      canvasInsets(),
+    );
+
+    cancelAnim(); // a viewport tween would fight the transition's own framing
+    unrollDirRef.current = "unroll";
+    unrollFrameRef.current = { chain, t: 0, heightOf, from: viewportRef.current, to };
+
+    const started = performance.now();
+    const step = (now: number) => {
+      const frame = unrollFrameRef.current;
+      if (!frame) return; // skipped mid-flight
+      frame.t = Math.min(1, (now - started) / duration);
+      if (frame.t >= 1) {
+        unrollRafRef.current = null;
+        finishUnroll();
+        return;
+      }
+      paintRef.current();
+      unrollRafRef.current = requestAnimationFrame(step);
+    };
+    unrollRafRef.current = requestAnimationFrame(step);
+  }, [perimeter, unravelGap, unravelHeights, unravelHeight, cancelAnim, toggleUnravel, finishUnroll]);
+
+  /**
+   * Play the transition IN REVERSE and return to the footprint — the exact inverse of
+   * {@link startUnroll}, using the same chain and the same tween with `t` driven 1 -> 0.
+   * So the walls fold back up in the order they unrolled, which is what makes the round
+   * trip legible rather than two unrelated moves.
+   *
+   * The elevation view is left at the START of the run, not the end: the frame owns the
+   * canvas for the whole tween (paint returns early while it is set), so exiting first
+   * costs nothing visually and means the animation's final frame IS the plan, with no
+   * jump when the frame clears. Falls back to a direct exit whenever there is nothing
+   * to animate, so the destination is never gated on the animation.
+   */
+  const startFold = useCallback(() => {
+    const { w, h } = sizeRef.current;
+    const planView =
+      perimeter.vertices.length > 0
+        ? fitViewport(perimeter, w, h, 64, undefined, 1, canvasInsets())
+        : viewportRef.current;
+    const chain = buildUnrollChain(perimeter, unravelGap);
+    const segments = unravelPerimeter(perimeter, unravelGap).segments;
+    const duration = unrollDurationMs(canvasRef.current);
+    // Same bail-out conditions as the forward run — see startUnroll.
+    if (!chain || segments.length === 0 || chain.panels !== segments.length || duration <= 0) {
+      toggleUnravel();
+      setViewport(planView);
+      return;
+    }
+
+    const heightOf = (edge: number) => unravelHeights[edge] ?? unravelHeight;
+    cancelAnim();
+    // Leave the elevation view now; the frame hides the swap (see the note above).
+    toggleUnravel();
+    unrollDirRef.current = "fold";
+    unrollFrameRef.current = { chain, t: 1, heightOf, from: planView, to: viewportRef.current };
+
+    const started = performance.now();
+    const step = (now: number) => {
+      const frame = unrollFrameRef.current;
+      if (!frame) return; // skipped mid-flight
+      frame.t = Math.max(0, 1 - (now - started) / duration);
+      if (frame.t <= 0) {
+        unrollRafRef.current = null;
+        finishFold();
+        return;
+      }
+      paintRef.current();
+      unrollRafRef.current = requestAnimationFrame(step);
+    };
+    unrollRafRef.current = requestAnimationFrame(step);
+  }, [perimeter, unravelGap, unravelHeights, unravelHeight, cancelAnim, toggleUnravel, finishFold]);
+
+
+  /**
+   * The Projects popup's "Unroll Geometry / Fold to Plan" action — the single route
+   * between the footprint and the elevations, and the replacement for the removed top
+   * navigation tabs.
+   *
+   * It TOGGLES rather than only entering, because Escape steps back no further than the
+   * full elevation strip: without a fold-back the user would have no way home. Entering
+   * plays the unroll transition, which is the whole point — seeing which wall became
+   * which panel is the information the animation carries. Folding back clears the drill
+   * state (focused panel/cell) so returning later starts at the strip, not mid-zoom, and
+   * re-frames the footprint the way entering the Plan phase does.
+   */
+  const toggleUnrollView = useCallback(() => {
+    // Folding back plays the SAME transition in reverse (startFold), so the walls fold
+    // up in the order they unrolled. toggleUnravel's exit branch already clears the
+    // focused panel/cell, so returning later starts at the strip rather than mid-zoom.
+    if (unravelOn) startFold();
+    else if (canUnravel) startUnroll();
+  }, [unravelOn, canUnravel, startUnroll, startFold]);
+  // Publish for the keyboard handler defined ABOVE this point (see toggleUnrollViewRef).
+  toggleUnrollViewRef.current = toggleUnrollView;
+  // ABANDON the transition (stay put, enter nothing) when the shape it was unrolling
+  // is replaced out from under it — New project, loading a save, an undo — or when the
+  // component unmounts. Keyed on `perimeter` identity, which every one of those paths
+  // changes; the transition itself never touches it, so a normal run is unaffected.
+  useEffect(
+    () => () => {
+      if (unrollRafRef.current !== null) cancelAnimationFrame(unrollRafRef.current);
+      unrollRafRef.current = null;
+      unrollFrameRef.current = null;
+    },
+    [perimeter],
+  );
+
+  /* The "Selected vertex" panel section (Smooth / Corner buttons) was removed — both
+     actions are already direct manipulations on the canvas: drag a vertex's handle knob
+     to smooth it, double-click the vertex to make it a corner. `setHandle` /
+     `clearVertexHandles` are still used by those gestures in the pointer handlers. */
+
 
   // Current workflow phase derived from view state:
   //   perimeter  — drawing / editing the building footprint (default)
@@ -4704,48 +6825,36 @@ export default function PolylineTool() {
     ? "panels"
     : "elevations";
 
-  // Does ANY panel in the project carry centerlines (Centerlines tool divisions /
-  // dividers)? Gates the Cells tab: with centerlines anywhere the user can jump
-  // straight to the cells view; with none there is nothing to navigate into.
-  const hasAnyCenterlines =
-    Object.values(panelDivisions).some((a) => a.length > 0) ||
-    Object.values(panelDividersH).some((a) => a.length > 0);
+  // Floor Lines gate: just the elevation view. Floor plates are a GLOBAL list of
+  // elevations — a building datum that no curtain-wall system reads — so the old
+  // `hasAnyCwType` requirement gated them behind a prerequisite they never used. It also
+  // had the sequence backwards: row centerlines SNAP to floor plates, so setting levels
+  // is the thing you want to do first, not third.
+  const canPlaceLines = unravelOn;
 
-  // Has ANY panel been assigned a curtain-wall type? `cwType` above only reflects the
-  // FOCUSED panel, so when the user picks a CW Type with no panel focused (which
-  // applies it to every panel) it stays null. This project-wide check drives the
-  // Floor Lines / Centerlines enablement so selecting a CW type unlocks them even
-  // without a focused panel.
-  const hasAnyCwType = Object.values(panelCwType).some((t) => t != null);
+  // Centerlines gate: a focused wall border, and nothing else. Divisions are plain
+  // offsets along the panel — the CW system changes how FRAMING renders on those lines,
+  // never where the lines go, so requiring a type first was incidental.
+  const canPlaceCenterlines = focusedPanel !== null;
 
-  // Floor Lines gate: floor lines are GLOBAL, so the button is available in the
-  // unravel view once a CW type is assigned anywhere (focused panel's, or applied to all).
-  const canPlaceLines = unravelOn && hasAnyCwType;
-
-  // Centerlines gate: centerlines are placed on the SELECTED wall border, so the
-  // button requires a FOCUSED panel that HAS a CW type. `cwType` is the focused
-  // panel's type (null when no panel is focused OR the focused panel has no type),
-  // so this stays disabled until the user opens the Wall Border tab / clicks a wall
-  // border AND that border carries a CW type.
-  const canPlaceCenterlines = cwType !== null;
-
-  // Framing gate: framing offsets are measured FROM centerlines, so the button
-  // becomes available only once the FOCUSED panel carries at least one centerline
-  // (a vertical division or a horizontal divider). With no centerlines there is
-  // nothing to frame, so it stays disabled.
+  // Framing gate: BOTH prerequisites are real here. Offsets are measured FROM
+  // centerlines, so there must be at least one; and Stick (mullion bands straddling a
+  // grid line) versus Unitized (per-cell edge insets) are different interactions, so the
+  // system has to be chosen or the tool would arm with no behaviour to run. `cwType` used
+  // to be implied — centerlines required it — but now that centerlines are ungated it has
+  // to be stated.
   const canFrame =
     focusedPanel !== null &&
+    cwType !== null &&
     ((panelDivisions[focusedPanel]?.length ?? 0) > 0 ||
       (panelDividersH[focusedPanel]?.length ?? 0) > 0);
 
-  // Type gate: the Type tool assigns a glazing type to the SELECTED cells, so the button is
-  // clickable only once the user has selected at least one cell in the Wall Border phase
-  // (click a cell to select it; Shift+click for the whole Material-ID family). Disabled with
-  // nothing selected, in the Building Perimeter tab, and anywhere outside the Wall Border phase.
-  const canType = unravelOn && phase === "panels" && selectedCells.length > 0;
-  // Can the user actually assign a type right now? Identical to canType — a non-empty
-  // selection IS the requirement (the submenu options gate on this).
-  const canAssignType = canType;
+  // Glazing gate: the tool paints a type onto the cells of the FOCUSED wall border, so all
+  // it needs is that border — the Wall Border (panels) phase, which by definition means a
+  // panel is focused and we have not drilled deeper into a single cell. It deliberately no
+  // longer requires a selection: the selection is now made WITH the tool (by clicking or
+  // dragging across cells), so requiring one first would be a chicken-and-egg gate.
+  const canType = unravelOn && phase === "panels";
   // Has ANY wall border been assigned at least one cell type? This drives the Type button's
   // VISIBILITY toggle (eye) independently of `canType`: the eye shows/hides the per-cell hatches
   // and stays usable whenever there are hatches to toggle — even with no selection (Type button
@@ -4776,8 +6885,11 @@ export default function PolylineTool() {
     }
   }, [canFrame, mullionsOn]);
   useEffect(() => {
-    if (!canType && typeOn) setTypeOn(false);
-  }, [canType, typeOn]);
+    if (!canType) {
+      setTypeOn(false);
+      setGlazingBrush(null); // losing the wall border unloads the brush along with the tool
+    }
+  }, [canType]);
   // CLEAR THE CELL SELECTION when the user switches the focused wall border or leaves the
   // unravel view: the selection is per-border (and may include project-wide Shift picks),
   // so it must not carry over to a different panel or persist after backing out. Selecting
@@ -4785,20 +6897,24 @@ export default function PolylineTool() {
   useEffect(() => {
     setSelectedCells([]);
   }, [focusedPanel, unravelOn]);
-  // Render / Constraint / Export are unravel-view only — un-arm them on returning to
-  // the Building Perimeter tab so none lingers while its button is disabled, and drop
-  // the export marquee / selection / popup (all only make sense in the unravel view).
+  // Selecting cells exits the overall-dimension readout so it shows the per-cell dims;
+  // deselecting (empty selection) then returns to the per-column/row grid, and a further
+  // empty-canvas click re-enters overall. So any selection resets the overall flag.
+  useEffect(() => {
+    if (selectedCells.length > 0) setPanelDimsOverall(false);
+  }, [selectedCells]);
+  // Export is unravel-view only — un-arm it on returning to the Plan phase so it never
+  // lingers while its button is disabled, and drop the export marquee / selection /
+  // popup (all only make sense in the unravel view).
   useEffect(() => {
     if (!unravelOn) {
-      setRenderOn(false);
-      setConstraintOn(false);
       setExportSelectMode(false);
       setExportSelection(new Set());
       setMarquee(null);
       setExportPopup(null);
     }
   }, [unravelOn]);
-  // Leaving the Building Perimeter tab (entering an unravel/elevation view) clears the
+  // Leaving the Plan phase (entering an unravel/elevation view) clears the
   // perimeter Draw/Edit/Erase selection so none stays highlighted on another tab.
   // Draw/Edit de-highlight on their own (their active state is gated to phase ===
   // "perimeter"); Erase is not phase-gated, so disarm it explicitly here. Keyed ONLY on
@@ -4807,293 +6923,545 @@ export default function PolylineTool() {
   useEffect(() => {
     if (unravelOn) setEraserOn(false);
   }, [unravelOn]);
+  // Select is the RESTING tool in both phases: in Plan a click picks the drawn shape or an
+  // underlay, in Elevations it picks a wall border and then a cell. Arming it explicitly
+  // (rather than leaving every tool off) means the bar always states what a click will do.
+  // Switching phase drops whatever was HELD, since a selection belongs to the phase that
+  // owns it, but keeps the tool itself in hand.
+  //
+  // EXCEPT ON ARRIVAL. The app opens in Plan on an empty canvas, where there is nothing to
+  // select and only one thing to do — draw the perimeter. Arming Select there meant every
+  // session began by putting a tool down before any work could start, so on arrival the
+  // PEN is left in hand instead. (The Pen needs no arming: it is the tool whenever nothing
+  // else is held in Plan — see its button's active condition.) Nothing else changes:
+  // Select is still what every other tool returns to, and every phase switch arms it.
+  //
+  // Gated on the phase actually CHANGING rather than on "not the first run", because
+  // StrictMode mounts effects twice in development: a first-run flag would be spent on the
+  // first mount and the remount would arm Select anyway, so the Pen would be in hand in
+  // production and not in dev. Seeding the ref with the current phase makes both mounts a
+  // no-op, so what ships is what is being looked at.
+  // (`prevPhaseRef` is declared beside `newProject`, which writes it for the same reason
+  // arrival does — a brand-new project IS an arrival on an empty Plan canvas.)
+  useEffect(() => {
+    setSelectedImageId(null);
+    setHoveredImageHandle(null);
+    setPerimeterSelected(false);
+    setHoveredPerimeterHandle(null);
+    if (prevPhaseRef.current === unravelOn) return;
+    prevPhaseRef.current = unravelOn;
+    armSelectDefault();
+  }, [unravelOn, armSelectDefault]);
 
-  // Is the current sketch SAVED (a saved project is loaded/active)? A brand-new sketch
-  // has activeSavedId == null until "＋ Save current sketch" is used (see the auto-save
-  // effect). The downstream tabs (Elevations / Wall Border / Cells) stay disabled until
-  // then, so the user commits the footprint to a project before designing on top of it.
-  const isSaved = activeSavedId !== null;
-
-  // CONTEXTUAL TOOL HINT — short red guidance shown right of the X/Y cursor
-  // readouts in the status bar, coaching new users on what the active tool does.
-  // Priority: armed bottom-cluster tools first (mutually exclusive), then the
-  // perimeter draw/edit fallback. Empty string ⇒ no hint shown. Keep each entry
-  // terse and action-first; wording mirrors the ControlsList ("?" help) so the two
-  // never disagree — update both together when a control changes.
-  const toolHint = typeOn
-    ? "Pick a type — applies to the selected cell(s)"
-    : subtractiveOn
-    ? "Move cursor to size the split · click to place · hold Shift for horizontal rows"
-    : mullionsOn
-    ? cwType === "unitized"
-      ? "Click-drag a cell edge to inset framing · hold Shift to inset all four edges"
-      : "Click-drag a grid line to set the mullion offset (both sides)"
-    : eraserOn
-    ? unravelOn
-      ? "Click a centerline or floor line to delete · drag across several to erase in one stroke"
-      : "Click a perimeter vertex to delete it · drag across several to erase in one stroke"
-    : floorPlateMode
-    ? "Click to place a floor line · hold Shift to bypass snapping"
-    : phase === "perimeter" && mode === "draw" && perimeter.vertices.length > 0
-    ? "Click to place vertices · click-drag to convert to arc · hold Shift to lock 15° · double-click or Enter to close"
-    : phase === "perimeter" && mode === "edit"
-    ? "Drag a vertex to move · drag a knob to curve · double-click a vertex for a corner"
-    : // WALL BORDER cell selection cue: a split panel is focused with nothing selected yet,
-      // so coach the click / Shift+click selection that unlocks the Type button.
-      phase === "panels" && selectedCells.length === 0 && panelHasSubtractiveCells(focusedPanel ?? -1)
-    ? "Click a cell to select it · Shift+click selects all cells of that Material ID · then pick a Type"
-    : // Show whenever the FOCUSED wall border still has no CW Type (every time the user
-      // clicks into a type-less border, not just the very first one), and as the initial
-      // onboarding cue in the elevations overview while NO panel has a type yet.
-      unravelOn && cwType === null && (focusedPanel !== null || Object.keys(panelCwType).length === 0)
-    ? "Assign a CW Type to start"
-    : "";
 
   return (
-    <div className={`app ${panelCollapsed ? "app--panel-collapsed" : ""}`}>
-      {/* ===== NAVIGATION HEADER ===== */}
-      <header className="nav-header">
-        {/* NEW PROJECT — a blank-slate reset (like refreshing the page, but without the
-            onboarding hint). The only way to start a new project without reloading. */}
-        <button
-          className="nav-header__new"
-          onClick={newProject}
-          title="Create a new project"
-          aria-label="New project"
-        >
-          ＋
-        </button>
-        <button
-          className={`nav-header__btn ${phase === "perimeter" ? "is-active" : ""}`}
-          onClick={() => {
-            // Exit the unravel view if needed, then frame the footprint — like clicking
-            // the minimap. Runs even when ALREADY in Perimeter, so it re-fits the zoom.
-            if (unravelOn) toggleUnravel();
-            if (perimeter.vertices.length > 0) {
-              const { w, h } = sizeRef.current;
-              animateViewport(fitViewport(perimeter, w, h, 64));
-            }
-          }}
-          title="Building Perimeter — sketch and edit the building footprint"
-        >
-          Building Perimeter
-        </button>
-        <button
-          className={`nav-header__btn ${phase === "elevations" ? "is-active" : ""}`}
-          onClick={() => {
-            // Already on the full strip: just re-fit the zoom to show all elevations.
-            if (phase === "elevations") { fitUnravel(unravelGap, unravelHeights, unravelHeight); return; }
-            if (phase === "perimeter") { if (canUnravel) toggleUnravel(); }
-            // From panels OR assembly, back out to the full strip — clear both the
-            // panel focus and any deeper cell focus so the phase resolves to elevations.
-            else { setFocusedCell(null); setFocusedPanel(null); fitUnravel(unravelGap, unravelHeights, unravelHeight); }
-          }}
-          disabled={!isSaved}
-          title="Unroll Elevations — unwrapped building perimeter"
-        >
-          Unroll Elevations
-        </button>
-        <button
-          className={`nav-header__btn ${phase === "panels" ? "is-active" : ""}`}
-          disabled={!isSaved}
-          onClick={() => {
-            if (phase === "panels") return;
-            // From the deeper Assembly layer, back out ONE level to the focused panel
-            // (clear the cell, re-frame the panel) rather than jumping to the first.
-            if (phase === "assembly") {
-              if (focusedPanel !== null) { setFocusedCell(null); zoomToPanel(focusedPanel); }
-              return;
-            }
-            // From perimeter/elevations: compute the first (left-most) segment directly
-            // — unravelResult is null when unravelOn is false, so recalc from perimeter.
-            const firstSeg = unravelPerimeter(perimeter, unravelGap).segments[0];
-            if (!firstSeg) return;
-            // Enter elevations WITHOUT the strip-fit (skipFitOnEnter) so our panel
-            // zoom below isn't cancelled by the strip-fit the toggle would otherwise
-            // dispatch from its state updater (which runs after this handler).
-            if (!unravelOn) toggleUnravel(true);
-            // Zoom straight to the first panel.
-            const h0 = effectiveHeight(firstSeg.index);
-            const { w, h } = sizeRef.current;
-            animateViewport(fitViewport(unravelBoundsPerimeter([firstSeg], () => h0), w, h, 56));
-            setFocusedPanel(firstSeg.index);
-          }}
-          title="Wall Border — individual building facades"
-        >
-          Wall Border
-        </button>
-        <button
-          className={`nav-header__btn ${phase === "assembly" ? "is-active" : ""}`}
-          // Cells is clickable once the sketch is SAVED and the project has ANY centerlines
-          // — there is a cell to navigate into. Disabled on an unsaved sketch or with no
-          // centerlines anywhere.
-          disabled={!isSaved || !hasAnyCenterlines}
-          onClick={() => {
-            if (phase === "assembly") return;
-            // Jump to a cell: prefer the focused panel when it has centerlines, else the
-            // first panel that does. Works from ANY phase (recompute the strip directly
-            // since unravelResult is null before the view is on).
-            const segs = unravelResult?.segments ?? unravelPerimeter(perimeter, unravelGap).segments;
-            const edge =
-              focusedPanel !== null && panelHasSubtractiveCells(focusedPanel)
-                ? focusedPanel
-                : segs.find((s) => panelHasSubtractiveCells(s.index))?.index ?? -1;
-            if (edge < 0) return;
-            // Default to the top-left-most cell (left-most column, top-most row).
-            const cell = topLeftCell(cellsForEdge(edge));
-            if (!cell) return;
-            // Enter the unravel view if needed (skip the strip-fit; our cell zoom follows).
-            if (!unravelOn) toggleUnravel(true);
-            setFocusedPanel(edge);
-            zoomToCell({ edge, ...cell });
-          }}
-          title="Cells — single panel units"
-        >
-          Cells
-        </button>
-        {/* RIGHT GROUP — search bar + settings gear, pushed to the far right of the header. */}
-        <div className="nav-header__right">
-          <div className="nav-header__search-wrap">
-            <input
-              className="nav-header__search"
-              type="text"
-              placeholder="Smart search"
-              aria-label="Smart search"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-            <span className="nav-header__search-sizer" aria-hidden="true">
-              {searchQuery || "Smart search"}
-            </span>
-          </div>
-          {/* EXPORT — between the Smart Search bar and the Settings gear. Arms the
-              wall-selection MARQUEE (unravel/elevation views only): click-drag a box over
-              the panels to pick walls, release opens the export dialog. Blue while armed,
-              white otherwise; disabled in the Building Perimeter tab. */}
-          <button
-            className={`nav-header__export ${exportSelectMode ? "is-active" : ""}`}
-            onClick={toggleExportSelect}
-            disabled={!unravelOn}
-            aria-pressed={exportSelectMode}
-            title={
-              unravelOn
-                ? "Export — click-drag a box over the panels to select walls, then export to Revit / AutoCAD / Rhino (Esc cancels)"
-                : "Switch to an elevation view to export walls"
-            }
-          >
-            {exportSelectMode ? "Selecting…" : "Export"}
-          </button>
-        <button
-          className={`nav-header__settings ${settingsOpen ? "is-active" : ""}`}
-          onClick={() => setSettingsOpen((on) => !on)}
-          title="Settings"
-          aria-label="Settings"
-          aria-pressed={settingsOpen}
-        >
-          {/* Gear icon (Lucide-style, stroke-based) — inherits the button's color via
-              currentColor, so it tints on hover and inverts in the active state. */}
-          <svg
-            className="nav-header__settings-icon"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.75"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
-            <circle cx="12" cy="12" r="3" />
-          </svg>
-        </button>
-        </div>
-      </header>
-
-      {/* ===== LEFT: TOOL PANEL ===== */}
-      <aside className="panel">
-        {/* CREATE — drawing tools: Segment (Line/Arc) and the curve-handle hint,
-            grouped under one titled section. The Draw/Edit MODE toggle lives in the
-            bottom-right tool cluster (with Eraser/Dim), not here. */}
-        <section className="panel__section">
-          <div className="panel__section-title">Create</div>
-
-          <div className="panel__row">
-            <span className="panel__label">Segment</span>
-            <div className="segmented">
-              <button
-                className={`segmented__btn ${curveType === "line" ? "is-active" : ""}`}
-                onClick={() => setCurveType("line")}
-                title="Draw straight segments (shortcut: L)"
-              >
-                Line (L)
-              </button>
-              <button
-                className={`segmented__btn ${curveType === "arc" ? "is-active" : ""}`}
-                onClick={() => setCurveType("arc")}
-                title="Draw curved segments (shortcut: A) — click-drag to shape the curve"
-              >
-                Arc (A)
-              </button>
-            </div>
-          </div>
-          <div className="panel__hint">
-            Click-drag while placing a point to pull out curve handles.
-          </div>
-        </section>
-
-        {mode === "edit" && selectedVertex >= 0 && (
-          <section className="panel__section">
-            <div className="panel__section-title">Selected vertex #{selectedVertex}</div>
-            <div className="panel__row">
-              <button className="btn" onClick={smoothSelected} title="Pull out symmetric curve handles">
-                Smooth
-              </button>
-              <button className="btn" onClick={cornerSelected} title="Remove handles (double-click vertex)">
-                Corner
-              </button>
-            </div>
-            <div className="panel__hint">Drag handle knobs to shape · Alt-drag breaks the tangent.</div>
-          </section>
-        )}
-
-        {/* Live perimeter / unravel statistics formerly shown here now live in the
-            "Statistics" dropdown (top of canvas, next to Redo) so they stay visible
-            over the canvas without taking panel space. */}
-
-        {/* ===== LOCATION (geo-location of the sketch) =====
-            An optional address line to geo-locate the perimeter. Stored with the
-            sketch so the planned Mapbox map view can reference it without the user
-            re-typing. Blank by default — an untouched sketch has no geolocation. */}
-        <section className="panel__section">
-          <div className="panel__section-title">Location</div>
-          <div className="panel__hint">
-            Type an address to geo-locate the sketch (optional — leave blank for none).
-          </div>
-          <div className="panel__row">
-            <input
-              className="panel__input"
-              type="text"
-              value={location.address}
-              placeholder="Address (e.g. 123 Main St, City)"
-              title="Address used to geo-locate the sketch — optional, leave blank for no location"
-              onChange={(e) => setLocation((l) => ({ ...l, address: e.target.value }))}
-            />
-          </div>
-        </section>
-      </aside>
+    <div className="app">
+      {/* The NAVIGATION HEADER was removed. Its live controls moved to where their
+          work already happens: New Project and Demo to the Projects popup footer
+          (project-level actions, beside "Save" and "Unroll Geometry"), Export to
+          the bottom tool bar (it arms a marquee, so it is a tool), and Settings to
+          the bottom-right beside the "?" help button (both are global panels). */}
 
       {/* ===== RIGHT: CANVAS + STATUS BAR ===== */}
       <main className="stage">
         <div className="canvas-wrap" ref={wrapRef}>
+        {/* ===== OVERVIEW WINDOW =====
+            A floating window over the canvas — the same chrome as
+            the Projects window on the right (identical .mini* classes, so the two are one
+            visual family and any change to that look applies to both). It is deliberately
+            NOT docked: the canvas is the workspace, and a permanently reserved column took
+            280px from it whether or not the panel was in use.
+            Order is Location first (a project-level fact you set once), then Display (the
+            view controls you return to constantly). The former "Create" section — the
+            Line / Arc segment switch — was removed; those stay on their A / L keyboard
+            shortcuts, and Draw/Edit live in the bottom tool bar. */}
+        <div
+          className={`mini mini--left mini--tall ${frontWin === "props" ? "mini--front" : ""}`}
+          ref={propsWinRef}
+          role="region"
+          aria-label="Overview"
+          onPointerDownCapture={() => setFrontWin("props")}
+        >
+          {/* TITLE BAR — drag handle + collapse toggle (mirrors the Projects window).
+              Drags THIS window only; Statistics below is a separate, independent panel. */}
+          <div
+            className="mini__titlebar"
+          >
+            <span className="mini__title">Overview</span>
+          </div>
+
+          <div className="mini__body panel-body">
+
+          {/* ===== PROJECT =====
+              First in the window because it is the first thing a user does and the last
+              thing they do: name the thing, save it, or start from something else. The
+              Projects window remains the LIBRARY (list, load, reorder, duplicate,
+              delete); these are the actions that operate on the CURRENT sketch, so they
+              belong here beside the properties they apply to.
+              NAME writes straight through: once saved, typing renames the saved entry
+              live (the Projects list updates as you type). Before the first save it
+              holds a draft that the Save button applies. */}
+          <section className="panel__section">
+            <div className="panel__section-title">Project</div>
+            {/* ONE row: the name field takes the space, Save and New sit to its right.
+                The "Name" label is dropped — the placeholder already says what the field
+                is, and at this width a label costs more than it explains. */}
+            <div className="panel__row">
+              <input
+                className="panel__input"
+                type="text"
+                value={activeSavedId ? saved.find((x) => x.id === activeSavedId)?.name ?? "" : projectNameDraft}
+                placeholder="Project Name"
+                title="Project name — renames the saved project as you type"
+                onChange={(e) => {
+                  if (activeSavedId) renameSavedEntry(activeSavedId, e.target.value);
+                  else setProjectNameDraft(e.target.value);
+                }}
+              />
+              {/* Both buttons are sized to their text (no flex growth) so the field keeps
+                  the remaining width — it is the control that actually needs it. */}
+              <button
+                className="btn btn--compact"
+                onClick={saveCurrent}
+                disabled={!saveable}
+                title={
+                  saveable
+                    ? "Save the current sketch as a new project (Ctrl+S)"
+                    : "Draw at least two vertices before saving"
+                }
+              >
+                Save
+              </button>
+              <button
+                className="btn btn--compact"
+                onClick={newProject}
+                title="Start a new, blank project (your saved projects are kept)"
+              >
+                New
+              </button>
+              {/* Demo moved to the top-right utility bar, beside Help and Export. */}
+            </div>
+            {/* THE PROJECT LIST — formerly its own floating "Projects" window. Folded in
+                here because it answers the same question as the fields above it (which
+                project am I in, and what else is there), and one window is cheaper than
+                two. Every row action is unchanged: click to load, drag to rotate the
+                preview, ✎ rename, ⧉ duplicate, × delete, drag a name to reorder. */}
+            <MiniWindow
+            // Embedded: the gallery renders inside this section, not as its own window.
+            embedded
+            saved={saved}
+            activeId={activeSavedId}
+            onLoad={loadSavedEntry}
+            onDelete={deleteSavedEntry}
+            onDuplicate={duplicateSavedEntry}
+            onRename={renameSavedEntry}
+            onReorder={reorderSaved}
+            onLocationChange={changeSavedLocation}
+            onSolarChange={changeSavedSolar}
+            // Solar Study open-state is CONTROLLED from here so the left panel's Display
+            // section can open the same popup a project row's ☀ opens.
+            solarId={solarStudyId}
+            onSolarIdChange={setSolarStudyId}
+            // Phase drives each thumbnail's default camera: aerial in Plan, 3/4 in
+            // Elevations (animated on the switch).
+            unravelOn={unravelOn}
+            stageRef={wrapRef}
+            // Hover-link: in the UNRAVEL view the hovered strip lights its matching
+            // wall PANEL; with nothing hovered it falls back to the FOCUSED border (the
+            // one zoomed into — kept lit so arrow-key navigation between borders shows
+            // the current focus on the minimap, as if moused over). In PERIMETER (edit)
+            // mode the hovered footprint edge lights its matching edge LINE instead
+            // (highlightAsLine below). MiniWindow applies it to the active entry only,
+            // whose geometry matches the live shape.
+            highlightEdge={unravelOn ? (hoveredUnravelEdge >= 0 ? hoveredUnravelEdge : focusedPanel ?? -1) : mode === "edit" ? hoveredEdge : -1}
+            // Perimeter-mode highlight draws the edge as a LINE on the footprint,
+            // not a filled wall panel (that panel fill is the unravel-mode behaviour).
+            highlightAsLine={!unravelOn}
+            // Per-panel heights of the LIVE shape -> the active (matching)
+            // thumbnail's per-wall heights; the global default applies to ALL
+            // thumbnails. Not gated on unravelOn: heights persist in state once
+            // set, so the active preview reflects them live as they change.
+            heights={unravelHeights}
+            defaultHeight={unravelHeight}
+            // The live editor shape — the active thumbnail renders THIS, so footprint
+            // (perimeter mode) and height (unravel mode) edits track in the preview
+            // immediately instead of snapping back to the stored snapshot.
+            livePerimeter={perimeter}
+            />
+          </section>
+
+          {/* ===== LOCATION (geo-location of the sketch) =====
+              The site address, stored with the sketch and read by the solar work (sun
+              path, shadows, irradiance). DEFAULTS to Omaha, NE — pre-resolved, so the
+              solar tools mean something from the first click; the user only types here
+              when the project is somewhere else. The on-screen blurb is deliberately
+              one line: the field is self-evident and the resolved-site readout below
+              already reports what was matched. */}
+          <section className="panel__section">
+            <div className="panel__section-title">Location</div>
+            <div className="panel__row">
+              <input
+                className="panel__input"
+                type="text"
+                value={location.address}
+                placeholder="Address or 41.26, -95.94"
+                title="Address (or literal coordinates) used to locate the sketch — Enter to resolve, blank for no location"
+                onChange={(e) => setLocation((l) => ({ ...l, address: e.target.value }))}
+                // Commit on Enter or blur, never per keystroke: resolving mid-word would
+                // repeatedly jump the solar study to whatever city the prefix matched.
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void commitAddress((e.target as HTMLInputElement).value);
+                  }
+                }}
+                onBlur={(e) => void commitAddress(e.target.value)}
+              />
+              {/* SOLAR — shares the address row because it CONSUMES what that field
+                  produces: the resolved latitude, longitude, and time zone are what place
+                  the sun. Sized to its text (btn--compact, no flex growth) so the field
+                  keeps the remaining width, exactly like Save / New on the Project row
+                  above; the row's own gap gives both clusters identical spacing.
+                  Labelled "Solar" rather than "Solar Study" so it fits beside the field
+                  without squeezing it — the ☀ and the tooltip carry the rest.
+                  Disabled until a project is saved or loaded, since the study reads a
+                  saved project's massing. */}
+              <button
+                data-tour="solar"
+                className={`btn btn--icon btn--compact ${solarStudyId !== null ? "is-active" : ""}`}
+                onClick={() => setSolarStudyId((id) => (id === null ? activeSavedId : null))}
+                disabled={activeSavedId === null}
+                aria-pressed={solarStudyId !== null}
+                title={
+                  activeSavedId === null
+                    ? "Save or load a project first — the study reads a saved project's massing"
+                    : "Solar Study — sun path, orientation, and shadow settings for this project"
+                }
+              >
+                <span aria-hidden="true">☀</span>
+                Solar
+              </button>
+            </div>
+
+            {/* ATTRIBUTION — the bundled place data is GeoNames under CC BY 4.0, which
+                requires visible credit. Sits directly under the field it describes, in the
+                same monospace-dim treatment as the resolved coordinates, so everything
+                beneath the input reads as one block of metadata about it. */}
+            <div className="geo-credit">
+              Place data ©{" "}
+              <a href="https://www.geonames.org/" target="_blank" rel="noreferrer noopener">
+                GeoNames
+              </a>
+              , CC BY 4.0
+            </div>
+
+            {/* RESOLUTION READOUT — always states what the tool matched, so a wrong or
+                ambiguous guess is visible rather than silently driving the solar study. */}
+            {geoStatus === "resolving" && <div className="panel__hint">Resolving…</div>}
+
+            {geoStatus === "missing" && (
+              <div className="geo-readout geo-readout--missing">
+                No match — the study keeps its default site. Try a nearby larger town, or
+                type coordinates as "41.26, -95.94".
+              </div>
+            )}
+
+            {geoStatus === "resolved" && location.lat !== null && location.lng !== null && (
+              <div className="geo-readout">
+                {/* The field itself now carries the matched place, so only repeat it here
+                    when it says something different — e.g. the "near <city>" label that
+                    typed coordinates resolve to. */}
+                {location.label && location.label !== location.address && (
+                  <div className="geo-readout__place">{location.label}</div>
+                )}
+                <div className="geo-readout__coords">
+                  {location.lat.toFixed(2)}°, {location.lng.toFixed(2)}°
+                  {typeof location.elevationM === "number" && <> · {location.elevationM} m</>}
+                </div>
+                {location.timeZone && <div className="geo-readout__coords">{location.timeZone}</div>}
+              </div>
+            )}
+
+            {/* One-click corrections for an ambiguous name — the several Springfields. */}
+            {geoStatus === "resolved" && geoAlternatives.length > 0 && (
+              <div className="geo-alts">
+                <div className="geo-alts__label">Did you mean</div>
+                {geoAlternatives.map((p) => (
+                  <button
+                    key={`${p.name}|${p.region}|${p.country}`}
+                    className="geo-alts__btn"
+                    onClick={() => pickAlternative(p)}
+                    title={`Use ${formatPlace(p)} (${p.lat.toFixed(2)}°, ${p.lng.toFixed(2)}°)`}
+                  >
+                    {formatPlace(p)}
+                  </button>
+                ))}
+              </div>
+            )}
+
+          </section>
+
+          {/* (SELECTED IMAGE moved OUT of this window into its own panel — see the
+              Selected image window at the end of the right column, under Statistics.) */}
+          </div>
+
+        </div>
+
+        {/* ===== DISPLAY WINDOW =====
+            Second in the LEFT column, stacked under Overview. Same chrome and width as the
+            others. It sits on the left because that column is about the DRAWING, leaving
+            the right column to the readings taken off it — and because Statistics, which
+            grows as readings are switched on, needs a column it can grow down into
+            without shoving this out of reach.
+            It holds the two controls that decide WHAT IS DRAWN — view mode and per-element
+            visibility — which is why they left the Overview window: Overview is about the
+            project (name, site, selection); this is about the picture.
+            Both groups are compact GRIDS rather than stacked rows: as rows they cost ten
+            full-width lines for settings that are glanced at, not read. */}
+        <div
+          className={`mini mini--left ${frontWin === "display" ? "mini--front" : ""}`}
+          ref={displayWinRef}
+          style={displayWinStyle}
+          role="region"
+          aria-label="Display"
+          onPointerDownCapture={() => setFrontWin("display")}
+        >
+          <div
+            className="mini__titlebar"
+          >
+            <span className="mini__title">Display</span>
+          </div>
+
+          <div className="mini__body panel-body">
+            <section className="panel__section">
+            {/* VIEW MODE — the same compact picker the Statistics panel uses: one line
+                showing the current mode instead of a grid of every option. The canvas
+                itself is the confirmation of what is selected, so the list has nothing to
+                prove by staying open, and the height it cost is height the visibility grid
+                below can use. Wheel-cycles like the Statistics one.
+                Elevation views only — these are cell treatments, and the footprint has no
+                cells — so it disables in the Plan phase. */}
+            <div className="panel__subtitle">View mode</div>
+            <div
+              data-tour="viewmode"
+              className="panel__select-wrap"
+              // WHEEL to cycle without opening the list — the fastest way to flip between
+              // treatments while looking at the canvas. stopPropagation keeps the canvas
+              // from zooming under the cursor.
+              onWheel={(e) => {
+                if (!unravelOn) return;
+                e.stopPropagation();
+                const i = CELL_VIEW_MODES.indexOf(cellViewMode);
+                const next =
+                  e.deltaY > 0
+                    ? (i + 1) % CELL_VIEW_MODES.length
+                    : (i - 1 + CELL_VIEW_MODES.length) % CELL_VIEW_MODES.length;
+                selectViewMode(CELL_VIEW_MODES[next]);
+              }}
+            >
+              <select
+                className="panel__select"
+                value={cellViewMode}
+                disabled={!unravelOn}
+                aria-label="View mode"
+                title={
+                  unravelOn
+                    ? "Pick a view mode — or scroll the wheel over this to cycle"
+                    : "Available in the elevation views (switch to Elevations)"
+                }
+                onChange={(e) => selectViewMode(e.target.value as CellViewMode)}
+              >
+                {CELL_VIEW_MODES.map((m) => (
+                  <option key={m} value={m}>
+                    {CELL_VIEW_LABELS[m]}
+                  </option>
+                ))}
+              </select>
+              <span className="panel__select-chevron" aria-hidden="true">▾</span>
+            </div>
+
+            {/* VISIBILITY — the five eye toggles that used to be embedded in the bottom-bar
+                tool buttons, collected into one layers-style list. Moving them here
+                separates "arm this tool" from "show this element", which those combined
+                buttons conflated. Two columns: as five rows they dominated the window for
+                switches that are glanced at, not read. Labels are shortened to fit a
+                column; each row's tooltip carries the full name. */}
+            <div className="panel__subtitle">Visibility</div>
+            <div className="panel__vis-list panel__vis-list--grid">
+              <VisRow
+                label="Dims"
+                full="Dimensions"
+                visible={dimensionsVisible}
+                disabled={!unravelOn}
+                onToggle={() => setDimensionsVisible((v) => !v)}
+              />
+              <VisRow
+                label="Floors"
+                full="Floor lines"
+                visible={floorLinesVisible}
+                disabled={!unravelOn}
+                onToggle={() => setFloorLinesVisible((v) => !v)}
+              />
+              <VisRow
+                label="Centerlines"
+                visible={centerlinesVisible}
+                disabled={!unravelOn}
+                onToggle={() => setCenterlinesVisible((v) => !v)}
+              />
+              <VisRow
+                label="Framing"
+                visible={framingVisible}
+                disabled={!unravelOn}
+                onToggle={() => setFramingVisible((v) => !v)}
+              />
+              {/* Named for the TOOL that creates these hatches (Glazing), not for the data
+                  they come from (per-cell types) — the eye and the button that fills it in
+                  now say the same word. */}
+              <VisRow
+                label="Glazing"
+                full="Glazing types"
+                visible={typeVisible}
+                disabled={!hasAnyCellType}
+                onToggle={() => setTypeVisible((v) => !v)}
+              />
+            </div>
+
+            </section>
+          </div>
+        </div>
+
+        {/* STATISTICS — the panel is presentational (see StatisticsPanel.tsx): it renders
+            the reading it is handed and owns no state of its own. */}
+        <StatisticsPanel
+          statsModes={statsModes}
+          activeStatsModes={activeStatsModes}
+          onToggleStatsMode={toggleStatsMode}
+          unravelOn={unravelOn}
+          perimeter={perimeter}
+          unravelResult={unravelResult ?? null}
+          effectiveHeight={effectiveHeight}
+          uniqueCellCount={cellShapeColors.uniqueCount}
+          // The border the per-panel readings describe — the same index the canvas frames
+          // in red, so the window and the drawing can never name different walls.
+          anchorPanel={statsAnchorPanel}
+          faceBearings={faceBearings}
+          activeSolar={activeSolar}
+          panelWWR={panelWWR}
+          panelVLT={panelVLT}
+          // Whole-facade cost estimate (null outside Elevations) — see core/cost.ts.
+          costEstimate={costEstimate}
+          isFront={frontWin === "stats"}
+          onBringToFront={() => setFrontWin("stats")}
+          winRef={statsWinRef}
+          // Statistics is anchored by CSS (see .mini) — no computed offset to apply.
+          winStyle={undefined}
+        />
+
+        {/* ===== SELECTED IMAGE WINDOW =====
+            Last in the right column: utility bar → Statistics → this.
+            CONTEXTUAL — it only exists while an underlay is selected (or an import
+            is reporting), so it costs nothing the rest of the time and the column ends at
+            Statistics until you click an image.
+            It is a WINDOW rather than a section of Overview because it describes a
+            selection, not the project: it should appear next to the thing it edits and
+            vanish with it, which a permanent section in another panel cannot do.
+            Opacity and Lock live here rather than on the canvas because they are settings,
+            not direct manipulation — the canvas keeps the drag/resize gestures and nothing
+            else. `importStatus` shows here too: it reports on the import that produced the
+            selection, so this is where the user is already looking. */}
+        {!unravelOn && (importStatus || selectedImage) && (
+          <div
+            className={`mini ${frontWin === "image" ? "mini--front" : ""}`}
+            ref={imageWinRef}
+            style={imageWinStyle}
+            role="region"
+            aria-label="Selected image"
+            onPointerDownCapture={() => setFrontWin("image")}
+          >
+            <div className="mini__titlebar">
+              <span className="mini__title">Selected image</span>
+            </div>
+
+            <div className="mini__body panel-body">
+              <section className="panel__section">
+                {importStatus && <div className="panel__hint">{importStatus}</div>}
+                {selectedImage && (
+                  <>
+                    {/* File name TRUNCATES rather than widening the panel — names are
+                        arbitrary and often have no spaces to wrap at, which is what made
+                        this window scroll sideways. The full name stays on hover. */}
+                    <div className="panel__hint panel__hint--truncate" title={selectedImage.name}>
+                      {selectedImage.name}
+                    </div>
+                    {/* Size on its own line so it is never the thing pushed off. */}
+                    <div className="panel__hint">
+                      {fmtLength(selectedImage.w, 2)} × {fmtLength(selectedImage.h, 2)}
+                    </div>
+                    {/* Opacity: an underlay is meant to be traced over, so fading it is the
+                        control that makes the drawing on top readable. */}
+                    <div className="panel__row">
+                      <label className="panel__label" htmlFor="ref-image-opacity">Opacity</label>
+                      <input
+                        id="ref-image-opacity"
+                        className="panel__slider"
+                        type="range"
+                        min={5}
+                        max={100}
+                        step={5}
+                        value={Math.round(selectedImage.opacity * 100)}
+                        // Live-drag without history, then one undo step on release —
+                        // otherwise a single slider drag would bury the stack in steps.
+                        onChange={(e) => updateSelectedImage({ opacity: Number(e.target.value) / 100 }, false)}
+                        onPointerDown={() => recordHistory()}
+                      />
+                      <span className="panel__unit panel__unit--pct">{Math.round(selectedImage.opacity * 100)}%</span>
+                    </div>
+                    <div className="panel__row">
+                      {/* Lock pins the underlay's PLACEMENT — no drag, no resize — so
+                          tracing over it can never nudge it. It stays SELECTABLE though,
+                          and the frame still shows while the grips do not: this panel is
+                          where Unlock lives, so a locked image that could not be picked
+                          could never be unlocked. */}
+                      <button
+                        className={`btn ${selectedImage.locked ? "is-active" : ""}`}
+                        onClick={() => updateSelectedImage({ locked: !selectedImage.locked })}
+                        aria-pressed={selectedImage.locked}
+                        title={
+                          selectedImage.locked
+                            ? "Unlock — allow the image to be moved and resized again"
+                            : "Lock — pin the image so tracing can't nudge it (still selectable, so you can unlock it)"
+                        }
+                      >
+                        {selectedImage.locked ? "Unlock" : "Lock"}
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={deleteSelectedImage}
+                        title="Delete this reference image (undoable)"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </>
+                )}
+              </section>
+            </div>
+          </div>
+        )}
+
           <canvas
             ref={canvasRef}
-            className={`canvas ${unravelOn && hoveredUnravelTop >= 0 ? "canvas--ns-resize" : ""}`}
+            // The hovered reference-image grip contributes its own resize cursor, so the
+            // pointer announces which way that corner/edge will scale before the drag.
+            // Pan stays last-declared in CSS and still wins when armed.
+            className={`canvas ${panArmed ? "canvas--pan" : ""} ${unravelOn && hoveredUnravelTop >= 0 ? "canvas--ns-resize" : ""} ${hoveredImageHandle ?? hoveredPerimeterHandle ? `canvas--${handleCursor((hoveredImageHandle ?? hoveredPerimeterHandle)!)}` : overImageBody || overShapeBody ? "canvas--move" : ""}`}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
             // Suppress the browser's native right-click menu ("Save image as…",
-            // "Copy image", "Inspect") over the canvas: right-click-drag is a PAN
-            // gesture here, so the context menu would interrupt navigation.
+            // "Copy image", "Inspect") over the canvas. The right button is bound to
+            // NOTHING here, and "nothing" has to mean nothing: a browser menu over the
+            // drawing is the one thing a stray right-click must not produce.
             onContextMenu={(e) => e.preventDefault()}
             onPointerLeave={() => {
               setCursorModel(null);
@@ -5114,7 +7482,7 @@ export default function PolylineTool() {
             onDoubleClick={onDoubleClick}
           />
           {/* ===== CURSOR CROSSHAIRS =====
-              Two thin full-canvas lines tracking the pointer in the Building Perimeter
+              Two thin full-canvas lines tracking the pointer in the Plan
               view (drawing or editing vertices). Positioned entirely via the native
               pointermove effect above (direct transform writes) for minimal lag.
               Pointer-transparent and low z-index, so it sits over the canvas drawing but
@@ -5132,447 +7500,393 @@ export default function PolylineTool() {
               (see the showHint / pointerdown effect above). */}
           {showHint && (
             <div className="canvas-hint" aria-hidden="true">
+              {/* Text only — the hand-drawn arrow that used to point from "project" toward
+                  the Projects window was removed. */}
               <div className="canvas-hint__text">
                 <span>Sketch perimeter</span>
-                <span>
-                  or load{" "}
-                  {/* The arrow is anchored to the word "project" (CSS), so it reads as
-                      drawn from it: the tail starts just below the word's centre (around the
-                      j/e), dips SOUTH-EAST first, then arcs up to point at the top-right
-                      corner. A short, elegant arch. */}
-                  <span className="canvas-hint__anchor">
-                    project
-                    <svg className="canvas-hint__arrow" viewBox="0 0 220 160" fill="none" aria-hidden="true">
-                      <path className="canvas-hint__arrow-shaft" d="M18 55 C 55 95, 150 60, 205 14" />
-                      {/* Open "V" arrowhead — barbs symmetric about the shaft's end
-                          tangent (≈(55,−46)), aimed up-right at the corner. */}
-                      <path className="canvas-hint__arrow-head" d="M180 20 L205 14 L194 38" />
-                    </svg>
-                  </span>
-                </span>
+                <span>or load project</span>
               </div>
             </div>
           )}
-          {/* ===== FLOATING HISTORY (UNDO/REDO) CONTROLS =====
-              Absolutely-positioned cluster at the TOP-LEFT of the canvas (inside
-              .canvas-wrap, its positioning context — exactly like the floor-plate
-              button below, but pinned to the top instead of the bottom). Sitting
-              inside the canvas area keeps it clear of the left tool panel, so it
-              never overlaps the panel's controls. Same handlers / disabled rules /
-              tooltips as before — only the placement/anchoring moved. */}
-          <div className="history-controls">
-            <button
-              className="history-btn history-btn--icon"
-              onClick={undo}
-              disabled={undoStack.length === 0}
-              title="Undo (Ctrl+Z)"
-              aria-label="Undo"
-            >
-              ↶
-            </button>
-            <button
-              className="history-btn history-btn--icon"
-              onClick={redo}
-              disabled={redoStack.length === 0}
-              title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
-              aria-label="Redo"
-            >
-              ↷
-            </button>
-            {/* STATISTICS selector — picks which stats overlay to show on the canvas.
-                "None" hides the overlay; "General" shows elevation stats anchored
-                below the left-most elevation panel. */}
-            <div
-              className="stats-anchor"
-              // Scroll-wheel cycles the statistics modes WITHOUT opening the menu —
-              // mirrors the View button. Only the currently-AVAILABLE modes are in the
-              // cycle: the solar diagrams ("Irradiance" + "Insolation") need a wall
-              // orientation, so they're skipped outside the unravel/elevation views.
-              // No-ops when the selector itself is disabled (no closed perimeter and not
-              // in an elevation view).
-              onWheel={(e) => {
-                if (!unravelOn && !perimeter.closed) return;
-                e.stopPropagation();
-                const modes: typeof statsMode[] = unravelOn
-                  ? ["none", "general", "irradiance", "insolation", "wwr", "vlt"]
-                  : ["none", "general"];
-                // Index off the EFFECTIVE (displayed) mode so cycling in the Building
-                // Perimeter view starts from what's shown — a carried-over solar pick
-                // reads as "none" there, not an off-list index.
-                const idx = modes.indexOf(effectiveStatsMode);
-                const next =
-                  e.deltaY > 0
-                    ? (idx + 1) % modes.length
-                    : (idx - 1 + modes.length) % modes.length;
-                setStatsMode(modes[next]);
-                setStatsMenuOpen(false);
-              }}
-            >
+          {/* ===== PHASE SWITCH ROW — TOP CENTER =====
+              Just the Plan / Elevations switch now, centered on the top
+              edge of the canvas (absolutely positioned inside .canvas-wrap, its
+              positioning context) — the mirror of the bottom-center tool bar, so the two
+              floating rows pair up top and bottom. Everything that used to share this row
+              has moved to where its work happens: Statistics / View mode / Render to the
+              Overview window's Display section, and Undo / Redo to the bottom tool bar
+              beside the tools whose edits they reverse. */}
+          <div className="phase-controls">
+            {/* PHASE SWITCH — the app's primary state change: footprint ↔ elevations.
+                It used to sit in the Projects window footer as "Unroll Geometry / Fold to
+                Plan", which hid the single most consequential control in the app inside a
+                window that can be collapsed or dragged away — and it gates most of the
+                bottom tool bar. As a two-state segmented switch it also SHOWS which phase
+                you are in, which the old one-button toggle never did.
+                Reuses the shared .segmented control (same look as the Settings unit
+                switch). Elevations is disabled until there is enough geometry to unroll;
+                both run the same `toggleUnrollView`, which plays the unroll / fold
+                transition, so clicking the phase you are already in is a no-op. */}
+            <div className="segmented history-phase" role="group" aria-label="Phase">
               <button
-                className="history-btn"
-                onClick={() => {
-                  setStatsMenuOpen((on) => !on);
-                  setCwMenuOpen(false);
-                  setViewMenuOpen(false);
-                  disarmClusterTools();
-                }}
-                // Enabled in the unravel/elevation views, OR in the Building Perimeter
-                // tab once a CLOSED perimeter exists (re-locks if the shape is reopened),
-                // so footprint stats are available wherever there's something to measure.
-                disabled={!unravelOn && !perimeter.closed}
-                title="Select the live statistics to display"
-                aria-haspopup="true"
-                aria-expanded={statsMenuOpen}
+                className={`segmented__btn${!unravelOn ? " is-active" : ""}`}
+                onClick={() => { if (unravelOn) toggleUnrollView(); }}
+                aria-pressed={!unravelOn}
+                title="Plan — draw and edit the building footprint"
               >
-                Statistics: {effectiveStatsMode === "none" ? "None" : effectiveStatsMode === "general" ? "General" : effectiveStatsMode === "irradiance" ? "Irradiance (W/m²)" : effectiveStatsMode === "insolation" ? "Insolation (kWh/m²)" : effectiveStatsMode === "wwr" ? "WWR" : "VLT"} ▾
+                <PlanIcon />
+                Plan
               </button>
-              {statsMenuOpen && (
-                <div className="view-menu" role="menu">
-                  <button
-                    className={`view-menu__btn ${effectiveStatsMode === "none" ? "is-active" : ""}`}
-                    role="menuitemradio"
-                    aria-checked={effectiveStatsMode === "none"}
-                    onClick={() => { setStatsMode("none"); setStatsMenuOpen(false); }}
-                  >
-                    None
-                  </button>
-                  <button
-                    className={`view-menu__btn ${effectiveStatsMode === "general" ? "is-active" : ""}`}
-                    role="menuitemradio"
-                    aria-checked={effectiveStatsMode === "general"}
-                    onClick={() => { setStatsMode("general"); setStatsMenuOpen(false); }}
-                  >
-                    General
-                  </button>
-                  {/* The solar diagrams are ELEVATION/wall-border reads (they need a wall
-                      orientation), so they're only meaningful in the unravel view; disabled
-                      in the Building Perimeter tab. Irradiance = the month×hour W/m² heatmap;
-                      Insolation = its monthly kWh/m² energy companion. */}
-                  <button
-                    className={`view-menu__btn ${effectiveStatsMode === "irradiance" ? "is-active" : ""}`}
-                    role="menuitemradio"
-                    aria-checked={effectiveStatsMode === "irradiance"}
-                    disabled={!unravelOn}
-                    title={unravelOn ? undefined : "Available in the elevation views (Unroll Elevations)"}
-                    onClick={() => { setStatsMode("irradiance"); setStatsMenuOpen(false); }}
-                  >
-                    Irradiance (W/m²)
-                  </button>
-                  <button
-                    className={`view-menu__btn ${effectiveStatsMode === "insolation" ? "is-active" : ""}`}
-                    role="menuitemradio"
-                    aria-checked={effectiveStatsMode === "insolation"}
-                    disabled={!unravelOn}
-                    title={unravelOn ? undefined : "Available in the elevation views (Unroll Elevations)"}
-                    onClick={() => { setStatsMode("insolation"); setStatsMenuOpen(false); }}
-                  >
-                    Insolation (kWh/m²)
-                  </button>
-                  {/* WWR is a per-wall read of the glazing types assigned to the panel's
-                      cells, so it only makes sense in the elevation views — disabled in the
-                      Building Perimeter tab, like the solar diagrams. */}
-                  <button
-                    className={`view-menu__btn ${effectiveStatsMode === "wwr" ? "is-active" : ""}`}
-                    role="menuitemradio"
-                    aria-checked={effectiveStatsMode === "wwr"}
-                    disabled={!unravelOn}
-                    title={unravelOn ? undefined : "Available in the elevation views (Unroll Elevations)"}
-                    onClick={() => { setStatsMode("wwr"); setStatsMenuOpen(false); }}
-                  >
-                    WWR
-                  </button>
-                  {/* VLT, like WWR, reads the per-cell glazing types, so it's an elevation-view
-                      read — disabled in the Building Perimeter tab. */}
-                  <button
-                    className={`view-menu__btn ${effectiveStatsMode === "vlt" ? "is-active" : ""}`}
-                    role="menuitemradio"
-                    aria-checked={effectiveStatsMode === "vlt"}
-                    disabled={!unravelOn}
-                    title={unravelOn ? undefined : "Available in the elevation views (Unroll Elevations)"}
-                    onClick={() => { setStatsMode("vlt"); setStatsMenuOpen(false); }}
-                  >
-                    VLT
-                  </button>
-                </div>
-              )}
-            </div>
-            {/* VIEW menu — a purely VISUAL display chooser for the elevation/Panels view
-                (NOT a tool: arms nothing, edits nothing). Sits to the RIGHT of Statistics
-                in the top-left cluster. Clicking opens a dropdown to pick the cell view
-                mode: Material ID tints cells by geometric shape; Orientation Heatmap
-                colours by facing direction; Clean is the white-infill presentation view;
-                Shadows is reserved (behaviour TBD). The unique-cell count lives in the
-                Statistics dropdown. Disabled outside the unravel view. The chevron marks
-                it as a menu. */}
-            <div
-              className="view-anchor"
-              onWheel={(e) => {
-                if (!unravelOn) return;
-                e.stopPropagation();
-                const idx = CELL_VIEW_MODES.indexOf(cellViewMode);
-                const next =
-                  e.deltaY > 0
-                    ? (idx + 1) % CELL_VIEW_MODES.length
-                    : (idx - 1 + CELL_VIEW_MODES.length) % CELL_VIEW_MODES.length;
-                setCellViewMode(CELL_VIEW_MODES[next]);
-                setViewMenuOpen(false);
-              }}
-            >
               <button
-                className="view-btn"
-                onClick={onViewMenu}
-                disabled={!unravelOn}
-                aria-haspopup="true"
-                aria-expanded={viewMenuOpen}
-                title="Select the view mode to display"
+                data-tour="phase-elevations"
+                className={`segmented__btn${unravelOn ? " is-active" : ""}`}
+                onClick={() => { if (!unravelOn) toggleUnrollView(); }}
+                disabled={!unravelOn && !canUnravel}
+                aria-pressed={unravelOn}
+                title={
+                  unravelOn
+                    ? "Elevations — the unrolled wall strip"
+                    : canUnravel
+                      ? "Elevations — lay every wall flat as an elevation strip"
+                      : "Draw a perimeter first, then switch to Elevations"
+                }
               >
-                View: {CELL_VIEW_LABELS[cellViewMode]} ▾
+                <ElevationsIcon />
+                Elevations
               </button>
-              {viewMenuOpen && (
-                <div className="view-menu" role="menu">
-                  {CELL_VIEW_MODES.map((m) => (
-                    <button
-                      key={m}
-                      className={`view-menu__btn ${cellViewMode === m ? "is-active" : ""}`}
-                      role="menuitemradio"
-                      aria-checked={cellViewMode === m}
-                      onClick={() => selectViewMode(m)}
-                    >
-                      {CELL_VIEW_LABELS[m]}
-                    </button>
-                  ))}
-                </div>
-              )}
             </div>
-            {/* RENDER · CONSTRAINT — sit at the RIGHT end of the top-left cluster, just
-                after the View ("view technical") menu, so the whole technical-view row
-                reads as one family. SCAFFOLDED toggle buttons (no behaviour yet): blue
-                while armed, white otherwise, and only clickable outside the Building
-                Perimeter tab (disabled until the user opens an unravel/elevation view). */}
+            {/* Statistics, View mode, and Render MOVED to the left panel's Display
+                section (a docked one-of-N list beats a dropdown for showing which
+                mode is active). This row is now history only: Undo + Redo. */}
+          </div>
+          {/* COMMAND BAR — centered directly BELOW the top-center button row.
+              The per-tool coaching hint that used to live here has been removed; the "?"
+              help panel is now the single place controls are explained. What remains is
+              the STORAGE-QUOTA warning, which is not guidance but an alert: reference
+              images can fill localStorage, and a save that has silently stopped working
+              costs the user their session. It stays on-canvas, where attention already
+              is, rather than in a far-away footer.
+              Rendered only when there IS something to report (no empty bar taking up
+              canvas), and pointer-transparent so it never intercepts a canvas drag. */}
+          {saveFailed && (
+            <div className="command-bar" role="status" aria-live="polite">
+              <span className="command-bar__prompt" aria-hidden="true">▸</span>
+              <span className="command-bar__warn">
+                Not saved — browser storage is full. Remove a reference image or delete a
+                project; recent changes exist only in this tab until a save succeeds.
+              </span>
+            </div>
+          )}
+          {/* BOTTOM-CENTER TOOL BAR — the single row of canvas tool buttons, centered on
+              the bottom edge of the canvas. It holds two clusters, left to right:
+                1. .bottomright-tools — Pan · Select · Delete · Pen (footprint tools)
+                2. .tool-controls     — Floor Lines · CW Type · Centerlines · Framing · Glazing
+              Both clusters keep their own class (and their own internal gap) so their
+              buttons/menus are unchanged; only this wrapper decides where the row sits.
+              (View mode lives in the Display window; the help reference is behind the
+              utility bar's Help button.) */}
+          <div className="bottom-tools">
+          {/* Left to right, divider-separated:
+                1. PICK    — Pan · Select. Neither modifies anything; they choose a view or
+                             an object, so they lead the bar.
+                2. MODIFY  — Delete · Pen.
+                3. PHASE   — Elevations only: Floor Lines · CW Type · Centerlines ·
+                             Framing · Glazing.
+              The leading run (Pan · Select · Erase · Draw) is present in BOTH phases and
+              never changes order, so those four are always in the same place under the
+              cursor. Select and Draw act only in Plan — underlays and footprint vertices
+              both live there — so in Elevations they render DISABLED rather than moving or
+              vanishing; the position is worth more than the pixel.
+              The deeper phase tools below still UNMOUNT rather than dim, because they are
+              a different set per phase rather than the same set in a different state. */}
+          {/* HISTORY (Undo / Redo) moved to the top-right utility bar — they act on the
+              DOCUMENT rather than on a tool, so they belong with the other app-level
+              actions rather than among the drawing tools. */}
+          <div className="bottomright-tools">
+            {/* PAN — first button in the bar. Click to arm (blue while armed): a left
+                click-drag then moves the VIEW. Holding SPACE arms it temporarily without
+                touching this toggle, so the button also lights up while Space is down.
+                Middle-drag / right-drag pan at any time regardless. */}
             <button
-              className={`history-btn ${renderOn ? "is-active" : ""}`}
-              onClick={() => setRenderOn((on) => !on)}
-              disabled={!unravelOn}
-              aria-pressed={renderOn}
-              title="Render"
+              className={`tool-btn ${panArmed ? "is-active" : ""}`}
+              onClick={onPan}
+              aria-pressed={panArmed}
+              title="Pan — click-drag the canvas to move the view (or hold Space and drag)"
             >
-              Render
+              <PanIcon />
+              Pan
             </button>
+            {/* SELECT (V) — beside Pan: both PICK rather than modify (Pan picks a view,
+                Select picks an object), so they lead the bar together. Active in BOTH
+                phases: in Plan it picks / moves / resizes a reference underlay, and in
+                Elevations it is the neutral pick tool — the state where a click selects a
+                wall border and then a cell. It is armed by default on entering Elevations. */}
             <button
-              className={`history-btn ${constraintOn ? "is-active" : ""}`}
-              onClick={() => setConstraintOn((on) => !on)}
-              disabled={!unravelOn}
-              aria-pressed={constraintOn}
-              title="Constraint"
+              className={`tool-btn ${selectMode ? "is-active" : ""}`}
+              onClick={onSelect}
+              aria-pressed={selectMode}
+              title={
+                phase === "perimeter"
+                  ? "Select (V) — click a reference image to pick it, drag to move, grips to resize"
+                  : "Select (V) — click a wall border, then a cell"
+              }
             >
-              Constraint
+              <SelectIcon />
+              Select
             </button>
           </div>
-          {/* BOTTOM-LEFT tool cluster — Collapse · CW Type · Floor plate · Centerlines · Framing.
-              A flex row (mirrors the top-left .history-controls) so the buttons are
-              spaced by a single small gap (--space-1) and stay a tight cluster regardless
-              of each button's rendered width. (The Eraser lives by the "?" help button,
-              bottom-right; the View button sits next to Statistics, top-left.) */}
-          <div className="tool-controls">
-            {/* COLLAPSE TOGGLE — collapses / expands the left tool panel. Sits first in
-                the cluster so it's always reachable even when the panel is hidden. */}
+          <span className="bottom-tools__divider" aria-hidden="true" />
+          {/* EDIT TOOLS — Erase leads (it acts in BOTH phases), followed by the Plan
+              phase's geometry tools. Erase sits with the tools that MODIFY the drawing
+              rather than with Pan/Select, which only pick. */}
+          <div className="bottomright-tools">
             <button
-              className="panel-collapse-toggle"
-              onClick={() => setPanelCollapsed((c) => !c)}
-              title="Toggle the left panel"
-              aria-label="Toggle the left panel"
-              aria-pressed={panelCollapsed}
+              className={`tool-btn ${eraserOn ? "is-active" : ""}`}
+              onClick={onEraser}
+              aria-pressed={eraserOn}
+              title="Delete — remove perimeter vertices and edges (Plan) or centerlines / floor lines (Elevations)"
             >
-              {panelCollapsed ? "▸" : "◂"}
+              <EraseIcon />
+              Delete
             </button>
-            {/* CW TYPE — second in the cluster. Assign the curtain-wall system to the
-                SELECTED panel. Opens a two-option menu (Stick / Unitized); the chosen one
-                relabels the button to "CW Type: <name>" and unlocks the Framing tool for
-                that panel. Disabled until a panel is selected, since the system is
-                per-panel. Switching a panel's type clears its framing of the other system
-                (centerlines kept). */}
-            <div className="cw-type-wrap">
+            {/* PEN — ONE tool for the whole footprint lifecycle. It replaces the old
+                Draw + Edit pair, which split a single job across two buttons and left one
+                of them permanently dimmed: Draw died the moment the shape closed, and Edit
+                was useless before it.
+                The shape's own state decides which behaviour is in hand:
+                  OPEN perimeter   -> DRAW: each click places the next vertex.
+                  CLOSED perimeter -> EDIT: select / drag / insert / delete vertices.
+                That switch already happened implicitly — closing the loop sets edit mode —
+                so this only makes the button honest about it. `penEditing` drives the label
+                and tooltip so the current behaviour is always readable.
+                Shown in BOTH phases so the bar's leading run (Pan · Select · Erase · Pen)
+                never changes order; it only ACTS in Plan, where the footprint lives. */}
+            <button
+              data-tour="pen"
+              className={`tool-btn ${phase === "perimeter" && !eraserOn && !panArmed && !selectMode ? "is-active" : ""}`}
+              onClick={() => {
+                // Pick the behaviour the geometry calls for, rather than a fixed mode.
+                setMode(perimeter.closed ? "edit" : "draw");
+                if (eraserOn) onEraser();
+                setPanMode(false); // taking a tool releases Pan's hold on the left drag
+                disarmSelect(); // ...and Select's hold on the left click
+              }}
+              disabled={phase !== "perimeter"}
+              aria-pressed={phase === "perimeter" && !eraserOn && !panArmed && !selectMode}
+              title={
+                phase !== "perimeter"
+                  ? "Pen draws and edits the footprint, which lives in the Plan phase"
+                  : penEditing
+                    ? "Pen (editing — the perimeter is closed) — drag a vertex to move, a knob to curve, click a segment to insert, double-click for a corner"
+                    : "Pen (drawing) — click to place vertices · double-click or Enter to close the perimeter"
+              }
+            >
+              <PenIcon />
+              Pen
+            </button>
+            {/* Import moved to the top-right utility bar, beside Export — the two file
+                actions belong together, and neither edits the model. */}
+          </div>
+          {/* Separates the tools that act on the FOOTPRINT (Pan · Select · Delete · Pen)
+              from the curtain-wall cluster that acts on a WALL BORDER. Rendered only with
+              that cluster, so the Plan phase never ends on a dangling rule. Same
+              .bottom-tools__divider as the one after Select. */}
+          {unravelOn && <span className="bottom-tools__divider" aria-hidden="true" />}
+          {/* ELEVATIONS phase — the curtain-wall cluster. */}
+          {/* CURTAIN-WALL cluster — Floor Lines · CW Type · Centerlines · Framing · Glazing.
+              Second in the bottom-center row (directly after the Dim button). A flex row
+              (mirrors the top-center .phase-controls) so the buttons are spaced by a single
+              small gap (--space-1) and stay a tight cluster regardless of each button's
+              rendered width. */}
+          {unravelOn && (
+            <div className="tool-controls">
+              {/* FLOOR LINES — FIRST in the cluster: it is the only tool here that needs
+                  nothing selected and nothing decided, so it is where the work starts.
+                  A single-function tool button (no submenu): click ARMS the placement tool —
+                  while active a ghosted dotted horizontal line tracks the cursor and a click
+                  drops a floor line; click an existing one to remove; Esc or re-click
+                  disarms. Floor lines only RENDER in the unravel/elevation view, so the
+                  button is DISABLED outside it. Stays highlighted while armed. */}
               <button
-                className="cwtype-btn"
-                onClick={onCwType}
-                disabled={!unravelOn}
-                aria-haspopup="true"
-                aria-expanded={cwMenuOpen}
-                title="Select curtain wall type"
-              >
-                {cwType ? `CW Type: ${CW_TYPE_LABELS[cwType]} ▾` : "CW Type ▾"}
-              </button>
-              {cwMenuOpen && (
-                <div className="cw-menu" role="menu">
-                  {(Object.keys(CW_TYPE_LABELS) as CwType[]).map((t) => (
-                    <button
-                      key={t}
-                      className={`cw-menu__btn ${cwType === t ? "is-active" : ""}`}
-                      role="menuitemradio"
-                      aria-checked={cwType === t}
-                      onClick={() => selectCwType(t)}
-                    >
-                      {CW_TYPE_LABELS[t]}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-            {/* FLOOR LINES — a single-function tool button (no submenu): click ARMS the
-                placement tool — while active a ghosted dotted horizontal line tracks the
-                cursor and a click drops a floor line; click an existing one to remove; Esc
-                or re-click disarms. The eye ICON embedded in the button's right edge toggles
-                VISIBILITY of all floor lines (draws / hides without deleting them). Floor
-                lines only RENDER in the unravel/elevation view, so the button — and its eye —
-                are DISABLED outside it. Stays highlighted while armed. */}
-            <div className="floorlines-wrap">
-              <button
-                className={`floorplate-btn has-vis ${floorPlateMode ? "is-active" : ""}`}
+                data-tour="floorlines"
+                className={`floorplate-btn ${floorPlateMode ? "is-active" : ""}`}
                 onClick={onFloorPlace}
                 disabled={!canPlaceLines}
                 aria-pressed={floorPlateMode}
-                title="Place floor lines"
+                title={
+                  canPlaceLines
+                    ? "Floor Lines — click to drop a level line at the cursor's elevation; click a line to remove it"
+                    : "Floor Lines — floor levels are drawn on the elevation walls, so switch to Elevations"
+                }
               >
+                <FloorLinesIcon />
                 Floor Lines
               </button>
-              <VisToggle
-                visible={floorLinesVisible}
-                disabled={!canPlaceLines}
-                onToggle={() => setFloorLinesVisible((v) => !v)}
-                label="floor lines"
-              />
-            </div>
-            {/* CENTERLINES — operates on the panel SELECTED via click, so it is DISABLED
-                until a panel is selected (focusedPanel !== null). The armed cluster tools
-                (CW Type's Framing / Floor plate / Centerlines) are mutually exclusive —
-                arming one disarms the rest. Cluster order: CW Type · Floor plate ·
-                Centerlines · Framing (Eraser is bottom-right by the "?"; View is top-left
-                by Statistics). */}
-            <div className="tool-vis-wrap">
+              {/* CW TYPE — assign the curtain-wall system to the SELECTED panel. Opens a
+                  two-option menu (Stick / Unitized); the chosen one relabels the button to
+                  "CW Type: <name>" and unlocks the Framing tool for that panel. Per-panel,
+                  so it needs a panel selected. Switching a panel's type clears its framing
+                  of the other system (centerlines kept). */}
+              <div className="cw-type-wrap">
+                {/* Lights while its menu is OPEN, exactly as Glazing does — they are the
+                    two drop-ups in this row and were behaving differently, so an open menu
+                    read as "armed" on one button and as nothing on the other. */}
+                <button
+                  data-tour="cwtype"
+                  className={`cwtype-btn ${cwMenuOpen ? "is-active" : ""}`}
+                  onClick={onCwType}
+                  disabled={!unravelOn}
+                  aria-haspopup="true"
+                  aria-expanded={cwMenuOpen}
+                  title={
+                    unravelOn
+                      ? "CW Type — choose the curtain-wall system (Stick or Unitized) for the selected wall border"
+                      : "CW Type — a curtain-wall system is assigned per wall border, so switch to Elevations"
+                  }
+                >
+                  <CwTypeIcon />
+                  {cwType ? `CW Type: ${CW_TYPE_LABELS[cwType]} ▾` : "CW Type ▾"}
+                </button>
+                {cwMenuOpen && (
+                  <div className="cw-menu" role="menu">
+                    {(Object.keys(CW_TYPE_LABELS) as CwType[]).map((t) => (
+                      <button
+                        key={t}
+                        className={`cw-menu__btn ${cwType === t ? "is-active" : ""}`}
+                        role="menuitemradio"
+                        aria-checked={cwType === t}
+                        onClick={() => selectCwType(t)}
+                      >
+                        {CW_TYPE_LABELS[t]}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {/* CENTERLINES — operates on the panel SELECTED via click, so it is DISABLED
+                  until a panel is selected (focusedPanel !== null). The armed cluster tools
+                  (Floor Lines / Centerlines / Framing) are mutually exclusive — arming one
+                  disarms the rest. Cluster order: Floor Lines · CW Type · Centerlines ·
+                  Framing · Glazing (Delete sits earlier in the same row, with Pan · Select ·
+                  Pen). */}
               <button
-                className={`subtractive-btn has-vis ${subtractiveOn ? "is-active" : ""}`}
+                data-tour="centerlines"
+                className={`subtractive-btn ${subtractiveOn ? "is-active" : ""}`}
                 onClick={onSubtractive}
                 disabled={!canPlaceCenterlines}
                 aria-pressed={subtractiveOn}
-                title="Place centerlines on selected wall border"
+                title={
+                  canPlaceCenterlines
+                    ? "Centerlines — drag inside the border to divide it into columns or rows; the cursor picks both spacing and direction"
+                    : "Centerlines — divide a single wall border, so click one first"
+                }
               >
+                <CenterlinesIcon />
                 Centerlines
               </button>
-              <VisToggle
-                visible={centerlinesVisible}
-                disabled={!canPlaceCenterlines}
-                onToggle={() => setCenterlinesVisible((v) => !v)}
-                label="centerlines"
-              />
-            </div>
-            {/* FRAMING — disabled until a CW Type is selected; arms the mullion/framing
-                offset tool. Last in the cluster. Mutually exclusive cluster tool. The eye
-                ICON embedded in its right edge toggles framing visibility on the canvas. */}
-            <div className="tool-vis-wrap">
+              {/* FRAMING — disabled until a CW Type is selected; arms the mullion/framing
+                  offset tool. Last in the cluster. Mutually exclusive cluster tool. The eye
+                  ICON embedded in its right edge toggles framing visibility on the canvas. */}
               <button
-                className={`mullions-btn has-vis ${mullionsOn ? "is-active" : ""}`}
+                data-tour="framing"
+                className={`mullions-btn ${mullionsOn ? "is-active" : ""}`}
                 onClick={onMullions}
                 disabled={!canFrame}
                 aria-pressed={mullionsOn}
-                title="Set framing offset from centerlines"
+                // Framing is the only tool with THREE prerequisites, so a single "why not"
+                // message would be wrong two times out of three. It names the one actually
+                // missing, in the order they have to be satisfied.
+                title={
+                  canFrame
+                    ? "Framing — drag a centerline (Stick) or a cell edge (Unitized) to set the mullion offset"
+                    : focusedPanel === null
+                      ? "Framing — offsets are set per wall border, so click one first"
+                      : cwType === null
+                        ? "Framing — assign a CW Type to this border first (Stick and Unitized frame differently)"
+                        : "Framing — offsets are measured from centerlines, so add one to this border first"
+                }
               >
+                <FramingIcon />
                 Framing
               </button>
-              <VisToggle
-                visible={framingVisible}
-                disabled={!canFrame}
-                onToggle={() => setFramingVisible((v) => !v)}
-                label="framing"
-              />
-            </div>
-            {/* TYPE — to the right of Framing. Opens a Vision / Spandrel / Opaque chooser
-                (drop-up, same rules as the CW Type menu): enabled once at least one cell is
-                SELECTED in the Wall Border view (click a cell to select; Shift+click for the
-                whole Material-ID family), blue while the menu is open, disabled otherwise.
-                Picking an option types the selection. The eye icon shows / hides the hatches. */}
-            <div className="tool-vis-wrap">
-              <button
-                className={`type-btn has-vis ${typeOn ? "is-active" : ""}`}
-                onClick={onType}
-                disabled={!canType}
-                aria-haspopup="true"
-                aria-expanded={typeOn}
-                title="Assign a glazing type to cells (None / Vision / Spandrel / Opaque)"
-              >
-                Assign ▾
-              </button>
-              {/* Visibility (eye) is DECOUPLED from the Type button's gate: it shows / hides the
-                  per-cell hatches and stays clickable whenever ANY wall border has a type
-                  assigned — even with no cell selected (Type button disabled). */}
-              <VisToggle
-                visible={typeVisible}
-                disabled={!hasAnyCellType}
-                onToggle={() => setTypeVisible((v) => !v)}
-                label="cell types"
-              />
-              {typeOn &&
-                (() => {
-                  // The SELECTION's current type — marks the active option. "none" means
-                  // every selected cell is UNTYPED; a CellType means they all share it;
-                  // undefined means the selection is mixed (no single active mark). Computed
-                  // ONCE for the whole menu (the None option marks active on "none").
-                  const activeType = ((): CellType | "none" | undefined => {
-                    if (selectedCells.length === 0) return undefined;
-                    let common: CellType | "none" | undefined;
-                    for (const sc of selectedCells) {
-                      const cells = cellsForEdge(sc.edge);
-                      const idx = cells.findIndex(
-                        (c) =>
-                          Math.abs(c.x0 - sc.x0) < 1e-6 &&
-                          Math.abs(c.y0 - sc.y0) < 1e-6 &&
-                          Math.abs(c.x1 - sc.x1) < 1e-6 &&
-                          Math.abs(c.y1 - sc.y1) < 1e-6,
-                      );
-                      const ty: CellType | "none" =
-                        (idx >= 0 ? panelCellTypes[sc.edge]?.[idx] : undefined) ?? "none";
-                      if (common === undefined) common = ty;
-                      else if (common !== ty) return undefined; // mixed → no mark
-                    }
-                    return common;
-                  })();
-                  return (
-                    <div className="cw-menu cw-menu--type" role="menu">
-                      {/* NONE — clears the type (back to untyped / no hatch). Listed first
-                          as the neutral / reset choice, ahead of the three glazing types. */}
+              {/* GLAZING — to the right of Framing, and a PAINT tool: pick a material from the
+                  chooser (drop-up, same rules as the CW Type menu), then apply it by clicking a
+                  cell or dragging across a run of them. Enabled whenever a wall border is
+                  focused; blue while the chooser is open OR a brush is loaded. The label carries
+                  the loaded material, so the bar always answers "what will a click paint?".
+                  Clicking it again puts the tool down. (Hatch visibility lives in the left
+                  panel's Display ▸ Visibility list.) */}
+              <div className="tool-vis-wrap">
+                <button
+                  data-tour="glazing"
+                  className={`type-btn ${typeOn || glazingBrush !== null ? "is-active" : ""}`}
+                  onClick={onType}
+                  disabled={!canType}
+                  aria-haspopup="true"
+                  aria-expanded={typeOn}
+                  title={
+                    glazingBrush !== null
+                      ? `Glazing: ${glazingBrush === "none" ? "None" : CELL_TYPE_LABELS[glazingBrush]} — click a cell, or drag across cells and release, to paint it. Click here to pick a different type; Esc puts the tool down.`
+                      : "Glazing — pick a type, then click or drag across cells to paint it on"
+                  }
+                >
+                  <AssignIcon />
+                  {glazingBrush === null
+                    ? "Glazing ▾"
+                    : `Glazing: ${glazingBrush === "none" ? "None" : CELL_TYPE_LABELS[glazingBrush]} ▾`}
+                </button>
+                {typeOn && (
+                  <div className="cw-menu cw-menu--type" role="menu">
+                    {/* The active mark is the LOADED brush, not the selection's common type:
+                        the menu's job here is to say which material is in hand. Clicking the
+                        marked one again unloads it — the chooser is also the tool's off
+                        switch, since the button itself always opens this menu. */}
+                    {/* NONE — paints cells back to untyped (no hatch), so un-assigning is the
+                        same gesture as assigning. Listed first as the neutral / reset choice. */}
+                    <button
+                      className={`cw-menu__btn cw-menu__btn--type type-none ${glazingBrush === "none" ? "is-active" : ""}`}
+                      role="menuitemradio"
+                      aria-checked={glazingBrush === "none"}
+                      title={
+                        glazingBrush === "none"
+                          ? "None is loaded — click to put the Glazing tool down"
+                          : "Paint cells back to untyped (clears the glazing type — no hatch)"
+                      }
+                      onClick={() => armGlazingBrush("none")}
+                    >
+                      <span className="type-swatch type-swatch--none" aria-hidden="true" />
+                      <span className="type-name">None</span>
+                      <span className="type-vlt">—</span>
+                    </button>
+                    {(Object.keys(CELL_TYPE_LABELS) as CellType[]).map((t) => (
                       <button
-                        className={`cw-menu__btn cw-menu__btn--type type-none ${activeType === "none" ? "is-active" : ""}`}
+                        key={t}
+                        className={`cw-menu__btn cw-menu__btn--type type-${t} ${glazingBrush === t ? "is-active" : ""}`}
                         role="menuitemradio"
-                        aria-checked={activeType === "none"}
-                        disabled={!canAssignType}
-                        title={canAssignType ? "Clear the glazing type (untyped — no hatch)" : "Select a cell first to assign a type"}
-                        onClick={() => selectCellType("none")}
+                        aria-checked={glazingBrush === t}
+                        title={
+                          glazingBrush === t
+                            ? `${CELL_TYPE_LABELS[t]} is loaded — click to put the Glazing tool down`
+                            : `Load ${CELL_TYPE_LABELS[t]} — VLT ${Math.round(CELL_TYPE_VLT[t] * 100)}% — then click or drag across cells to paint it`
+                        }
+                        // Loads the brush; the cells it goes on are chosen afterwards, on canvas.
+                        onClick={() => armGlazingBrush(t)}
                       >
-                        <span className="type-swatch type-swatch--none" aria-hidden="true" />
-                        <span className="type-name">None</span>
-                        <span className="type-vlt">—</span>
+                        <span className={`type-swatch type-swatch--${t}`} aria-hidden="true" />
+                        <span className="type-name">{CELL_TYPE_LABELS[t]}</span>
+                        {/* Industry-standard VLT for this type (CELL_TYPE_VLT) — same value the
+                            VLT statistics view uses, surfaced here so the choice is informed. */}
+                        <span className="type-vlt">VLT {Math.round(CELL_TYPE_VLT[t] * 100)}%</span>
                       </button>
-                      {(Object.keys(CELL_TYPE_LABELS) as CellType[]).map((t) => (
-                        <button
-                          key={t}
-                          className={`cw-menu__btn cw-menu__btn--type type-${t} ${activeType === t ? "is-active" : ""}`}
-                          role="menuitemradio"
-                          aria-checked={activeType === t}
-                          disabled={!canAssignType}
-                          title={canAssignType ? `Assign ${CELL_TYPE_LABELS[t]} — VLT ${Math.round(CELL_TYPE_VLT[t] * 100)}%` : "Select a cell first to assign a type"}
-                          // Applies to the current selection (one cell, or the whole Material-ID family via Shift+click).
-                          onClick={() => selectCellType(t)}
-                        >
-                          <span className={`type-swatch type-swatch--${t}`} aria-hidden="true" />
-                          <span className="type-name">{CELL_TYPE_LABELS[t]}</span>
-                          {/* Industry-standard VLT for this type (CELL_TYPE_VLT) — same value the
-                              VLT statistics view uses, surfaced here so the choice is informed. */}
-                          <span className="type-vlt">VLT {Math.round(CELL_TYPE_VLT[t] * 100)}%</span>
-                        </button>
-                      ))}
-                    </div>
-                  );
-                })()}
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
+          )}
+          {/* Export moved to the top-right utility bar, beside Demo and Help — it writes a
+              FILE rather than editing the model, so it sits with the other app-level
+              actions instead of among the drawing tools. */}
           </div>
           {/* UNRAVEL · per-panel height inputs. A DOM overlay (NOT canvas-drawn) of
               one <input> per rectangle, positioned by converting each rectangle's
@@ -5653,298 +7967,107 @@ export default function PolylineTool() {
               })}
             </div>
           )}
-          {/* STATISTICS OVERLAY — floats below and offset from a wall border's LEFT edge
-              when statsMode is "general" and the unravel view is active. By default
-              (no border selected) it anchors to the LEFT-MOST elevation panel; once a
-              wall border is selected (focusedPanel), it re-anchors to that border's left
-              edge instead, left-aligned with the same spacing. Tracks the viewport so it
-              pans/zooms with the canvas content. */}
-          {effectiveStatsMode === "general" && unravelOn && unravelResult && unravelResult.segments.length > 0 && (() => {
-            // Anchor segment: the selected wall border if one is focused, else the
-            // left-most panel. A stale focus (border no longer present) falls back too.
-            const anchorSeg =
-              (focusedPanel !== null
-                ? unravelResult.segments.find((s) => s.index === focusedPanel)
-                : undefined) ?? unravelResult.segments[0];
-            const pos = toScreen(viewport, { x: anchorSeg.x0, y: 0 });
-            return (
-              <div
-                className="stats-dropdown stats-dropdown--behind"
-                role="region"
-                aria-label="Live statistics"
-                style={{ position: "absolute", left: pos.x - 8, top: pos.y + 16, pointerEvents: "none" }}
-              >
-                <div className="stats-dropdown__title">General</div>
-                <div className="readout">
-                  <span className="readout__key">Segments</span>
-                  <span className="readout__val">{unravelResult.segments.length}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Unwrapped length</span>
-                  <span className="readout__val">{fmtLength(unravelResult.totalLength, 3)}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Total area</span>
-                  <span className="readout__val">
-                    {fmtArea(
-                      unravelResult.segments.reduce((sum, s) => sum + s.length * effectiveHeight(s.index), 0),
-                      3,
-                    )}
-                  </span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Unique cells</span>
-                  <span className="readout__val">{cellShapeColors.uniqueCount}</span>
-                </div>
-              </div>
-            );
-          })()}
-          {/* SOLAR RADIATION DIAGRAMS — the Irradiance (W/m²) month×hour heatmap and its
-              energy companion, the Insolation (kWh/m²) monthly bar chart, for ONE wall
-              border. Both anchor exactly like the General overlay: the SELECTED wall
-              border if one is focused, else the LEFT-MOST elevation. The matrix is built
-              from the live Solar Study settings (activeSolar: latitude, north offset) and
-              that wall's TRUE compass orientation (faceBearings) — same source of truth as
-              the Orientation Heatmap, so the diagrams are real per-facade data. They share
-              one matrix (the chart reads its monthlyTotals, the heatmap its cell grid).
-              Tracks the viewport so it pans/zooms with the canvas; renders BEHIND the minimap. */}
-          {(effectiveStatsMode === "irradiance" || effectiveStatsMode === "insolation") &&
-            unravelOn &&
-            unravelResult &&
-            unravelResult.segments.length > 0 &&
-            (() => {
-              const anchorSeg =
-                (focusedPanel !== null
-                  ? unravelResult.segments.find((s) => s.index === focusedPanel)
-                  : undefined) ?? unravelResult.segments[0];
-              const bearing = faceBearings[anchorSeg.index];
-              if (bearing === undefined) return null; // no resolvable orientation (open loop)
-              const matrix = buildRadiationMatrix(activeSolar, bearing);
-              const pos = toScreen(viewport, { x: anchorSeg.x0, y: 0 });
-              return (
-                <div
-                  className="stats-dropdown stats-dropdown--behind"
-                  role="region"
-                  aria-label={statsMode === "irradiance" ? "Irradiance diagram" : "Insolation chart"}
-                  style={{ position: "absolute", left: pos.x - 8, top: pos.y + 16, pointerEvents: "none" }}
-                >
-                  {statsMode === "irradiance" ? (
-                    <RadiationDiagram matrix={matrix} />
-                  ) : (
-                    <InsolationChart matrix={matrix} />
-                  )}
-                </div>
-              );
-            })()}
-          {/* WWR STATISTICS OVERLAY — the Window-to-Wall Ratio for ONE wall border, anchored
-              exactly like the General / solar overlays (the SELECTED border if focused, else
-              the LEFT-MOST elevation). Window = the panel's VISION cells; wall = the whole
-              panel rect. Shown both standard ways: Gross Opening (frames/mullions counted as
-              window) and Net Glazing (frames excluded). Same .stats-dropdown chrome / spacing
-              as the General overlay; tracks the viewport so it pans/zooms with the canvas. */}
-          {effectiveStatsMode === "wwr" && unravelOn && unravelResult && unravelResult.segments.length > 0 && (() => {
-            const anchorSeg =
-              (focusedPanel !== null
-                ? unravelResult.segments.find((s) => s.index === focusedPanel)
-                : undefined) ?? unravelResult.segments[0];
-            const w = panelWWR(anchorSeg.index);
-            const pos = toScreen(viewport, { x: anchorSeg.x0, y: 0 });
-            const pct = (r: number) => `${(r * 100).toFixed(1)}%`;
-            // PROVISIONAL: the WWR is only a FINAL figure once every cell is typed. Until then
-            // untyped cells are counted as opaque wall, so flag the result as in-progress (a
-            // "Typed N / M" coverage line + a "*" on the ratios + a footnote) rather than
-            // presenting an incomplete number as authoritative.
-            const untyped = w.cellCount - w.typedCount;
-            const incomplete = untyped > 0;
-            const star = incomplete ? " *" : "";
-            return (
-              <div
-                className="stats-dropdown stats-dropdown--behind"
-                role="region"
-                aria-label="Window-to-wall ratio"
-                style={{ position: "absolute", left: pos.x - 8, top: pos.y + 16, pointerEvents: "none" }}
-              >
-                <div className="stats-dropdown__title">WWR</div>
-                <div className="readout">
-                  <span className="readout__key">Wall area</span>
-                  <span className="readout__val">{fmtArea(w.wallArea, 2)}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Vision cells</span>
-                  <span className="readout__val">{w.visionCount} / {w.cellCount}</span>
-                </div>
-                <div className={`readout ${incomplete ? "readout--provisional" : ""}`}>
-                  <span className="readout__key">WWR · Gross Opening</span>
-                  <span className="readout__val">{pct(w.wwrGross)}{star}</span>
-                </div>
-                <div className={`readout ${incomplete ? "readout--provisional" : ""}`}>
-                  <span className="readout__key">WWR · Net Glazing</span>
-                  <span className="readout__val">{pct(w.wwrNet)}{star}</span>
-                </div>
-                {/* Coverage + provisional warning sit LAST, after all the WWR figures. */}
-                <div className={`readout ${incomplete ? "readout--warn" : ""}`}>
-                  <span className="readout__key">Assigned cells</span>
-                  <span className="readout__val">{w.typedCount} / {w.cellCount}{incomplete ? " ⚠" : ""}</span>
-                </div>
-                {incomplete && (
-                  <div className="stats-dropdown__note">
-                    * provisional — {untyped} cell{untyped === 1 ? "" : "s"} unassigned
-                  </div>
-                )}
-              </div>
-            );
-          })()}
-          {/* VLT STATISTICS OVERLAY — the Visible Light Transmittance of ONE wall border,
-              anchored exactly like the General / WWR / solar overlays (the SELECTED border if
-              focused, else the LEFT-MOST elevation). Lists the industry-standard VLT assigned
-              to each cell type (Vision admits light; Spandrel / Opaque are 0) and the wall's
-              EFFECTIVE VLT — the glass-area-weighted transmittance over the whole panel (the
-              daylighting effective aperture). Same .stats-dropdown chrome / spacing as the
-              General overlay; tracks the viewport so it pans/zooms with the canvas. */}
-          {effectiveStatsMode === "vlt" && unravelOn && unravelResult && unravelResult.segments.length > 0 && (() => {
-            const anchorSeg =
-              (focusedPanel !== null
-                ? unravelResult.segments.find((s) => s.index === focusedPanel)
-                : undefined) ?? unravelResult.segments[0];
-            const v = panelVLT(anchorSeg.index);
-            const pos = toScreen(viewport, { x: anchorSeg.x0, y: 0 });
-            const pct = (r: number) => `${(r * 100).toFixed(1)}%`;
-            // PROVISIONAL: like WWR, the effective aperture is only FINAL once every cell is
-            // typed (untyped cells admit no light here, biasing the figure low). Flag coverage
-            // + mark the computed aperture with "*" until the wall border is fully typed.
-            const untyped = v.cellCount - v.typedCount;
-            const incomplete = untyped > 0;
-            return (
-              <div
-                className="stats-dropdown stats-dropdown--behind"
-                role="region"
-                aria-label="Visible light transmittance"
-                style={{ position: "absolute", left: pos.x - 8, top: pos.y + 16, pointerEvents: "none" }}
-              >
-                <div className="stats-dropdown__title">VLT</div>
-                <div className="readout">
-                  <span className="readout__key">Vision</span>
-                  <span className="readout__val">{pct(v.visionVLT)}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Spandrel</span>
-                  <span className="readout__val">{pct(v.spandrelVLT)}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Opaque</span>
-                  <span className="readout__val">{pct(v.opaqueVLT)}</span>
-                </div>
-                <div className={`readout ${incomplete ? "readout--provisional" : ""}`}>
-                  <span className="readout__key">Effective aperture</span>
-                  <span className="readout__val">{pct(v.effectiveAperture)}{incomplete ? " *" : ""}</span>
-                </div>
-                {/* Coverage + provisional warning sit LAST, after all the VLT figures. */}
-                <div className={`readout ${incomplete ? "readout--warn" : ""}`}>
-                  <span className="readout__key">Assigned cells</span>
-                  <span className="readout__val">{v.typedCount} / {v.cellCount}{incomplete ? " ⚠" : ""}</span>
-                </div>
-                {incomplete && (
-                  <div className="stats-dropdown__note">
-                    * provisional — {untyped} cell{untyped === 1 ? "" : "s"} unassigned
-                  </div>
-                )}
-              </div>
-            );
-          })()}
-          {/* PERIMETER STATISTICS OVERLAY — the Building Perimeter tab counterpart of the
-              unravel overlay above. Shows footprint stats for the CLOSED perimeter, in the
-              same .stats-dropdown style. Anchored at the outline's LEFT-most x and BOTTOM-
-              most y (curve-accurate extents, so a bulging curve is respected), offset DOWN
-              so the box clears the drawn shape without overlapping it. Tracks the viewport,
-              so it pans/zooms with the canvas. */}
-          {effectiveStatsMode === "general" && !unravelOn && perimeter.closed && (() => {
-            const outline = flattenPerimeter(perimeter);
-            if (outline.length === 0) return null;
-            let minX = Infinity;
-            let maxX = -Infinity;
-            let minY = Infinity;
-            let maxY = -Infinity;
-            for (const q of outline) {
-              if (q.x < minX) minX = q.x;
-              if (q.x > maxX) maxX = q.x;
-              if (q.y < minY) minY = q.y;
-              if (q.y > maxY) maxY = q.y;
-            }
-            // Anchor: left-most x (alignment) + bottom-most y (model +Y up → largest screen
-            // y), so adding to `top` drops the box below the footprint.
-            const pos = toScreen(viewport, { x: minX, y: minY });
-            // A closed loop has one wall (edge) per vertex.
-            const wallCount = perimeter.vertices.length;
-            return (
-              <div
-                className="stats-dropdown stats-dropdown--behind"
-                role="region"
-                aria-label="Live statistics"
-                style={{ position: "absolute", left: pos.x - 8, top: pos.y + 24, pointerEvents: "none" }}
-              >
-                <div className="stats-dropdown__title">General</div>
-                <div className="readout">
-                  <span className="readout__key">Walls</span>
-                  <span className="readout__val">{wallCount}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Perimeter</span>
-                  <span className="readout__val">{fmtLength(perimeterLength(perimeter), 3)}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Footprint area</span>
-                  <span className="readout__val">{fmtArea(enclosedArea(perimeter), 3)}</span>
-                </div>
-                <div className="readout">
-                  <span className="readout__key">Extents</span>
-                  <span className="readout__val">
-                    {fmtLength(maxX - minX, 2)} × {fmtLength(maxY - minY, 2)}
-                  </span>
-                </div>
-              </div>
-            );
-          })()}
-          {/* Saved-perimeter mini-window overlay (anchored top-right of the canvas). */}
-          <MiniWindow
-            saved={saved}
-            activeId={activeSavedId}
-            onLoad={loadSavedEntry}
-            onDelete={deleteSavedEntry}
-            onDuplicate={duplicateSavedEntry}
-            onRename={renameSavedEntry}
-            onReorder={reorderSaved}
-            onLocationChange={changeSavedLocation}
-            onSolarChange={changeSavedSolar}
-            // Footer "+" saves the current sketch as a NEW preview (mirrors Ctrl+S);
-            // gated by `saveable` (needs ≥2 vertices) just like the old panel button.
-            onSave={saveCurrent}
-            canSave={saveable}
-            // The Save footer only belongs to the Building Perimeter tab (saving a new
-            // sketch). Hide it entirely in the unravel/elevation views.
-            showSave={!unravelOn}
-            stageRef={wrapRef}
-            // Hover-link: in the UNRAVEL view the hovered strip lights its matching
-            // wall PANEL; with nothing hovered it falls back to the FOCUSED border (the
-            // one zoomed into — kept lit so arrow-key navigation between borders shows
-            // the current focus on the minimap, as if moused over). In PERIMETER (edit)
-            // mode the hovered footprint edge lights its matching edge LINE instead
-            // (highlightAsLine below). MiniWindow applies it to the active entry only,
-            // whose geometry matches the live shape.
-            highlightEdge={unravelOn ? (hoveredUnravelEdge >= 0 ? hoveredUnravelEdge : focusedPanel ?? -1) : mode === "edit" ? hoveredEdge : -1}
-            // Perimeter-mode highlight draws the edge as a LINE on the footprint,
-            // not a filled wall panel (that panel fill is the unravel-mode behaviour).
-            highlightAsLine={!unravelOn}
-            // Per-panel heights of the LIVE shape -> the active (matching)
-            // thumbnail's per-wall heights; the global default applies to ALL
-            // thumbnails. Not gated on unravelOn: heights persist in state once
-            // set, so the active preview reflects them live as they change.
-            heights={unravelHeights}
-            defaultHeight={unravelHeight}
-            // The live editor shape — the active thumbnail renders THIS, so footprint
-            // (perimeter mode) and height (unravel mode) edits track in the preview
-            // immediately instead of snapping back to the stored snapshot.
-            livePerimeter={perimeter}
-          />
+          {/* ===== UTILITY BAR =====
+              A floating bar pinned above the Projects window at the top right, holding
+              every APP-LEVEL action — the ones that act on the document or the app rather
+              than on the drawing: Undo · Redo · Demo · Import · Export. Grouping them here
+              keeps the bottom bar purely about drawing tools.
+              Matched to the Projects window's width so the two read as one column, and a
+              FIXED height so that window can offset itself below by exactly that amount in
+              CSS — neither has to measure the other. Undo / Redo stay square icon buttons
+              and the three labelled actions share the remaining width equally, which is
+              what lets all five fit at --mini-width. (Help was removed from this bar — the
+              reference now opens with ? / F1.) */}
+          <div className="util-bar" role="toolbar" aria-label="Application actions">
+            <button
+              className="util-bar__btn util-bar__btn--icon"
+              onClick={undo}
+              disabled={undoStack.length === 0}
+              title="Undo (Ctrl+Z)"
+              aria-label="Undo"
+            >
+              ↶
+            </button>
+            <button
+              className="util-bar__btn util-bar__btn--icon"
+              onClick={redo}
+              disabled={redoStack.length === 0}
+              title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
+              aria-label="Redo"
+            >
+              ↷
+            </button>
+            {/* DEMO — plays the guided tour (core/demoTour.ts + DemoTour.tsx), which BUILDS
+                an example project step by step rather than loading a finished one. It lights
+                while the tour is running, and clicking it again ends the tour.
+                UNTIL IT HAS BEEN USED this visit its border pulses: a first-time visitor
+                faces a blank canvas and a bar of unfamiliar tools, and this is the one
+                control that explains the rest. The pulse is on the BORDER only — a filled
+                button here would read as "armed", which in this app means something else —
+                and it stops for good on the first click (see markDemoSeen). */}
+            <button
+              className={`util-bar__btn ${tourStep !== null ? "is-active" : ""} ${
+                !demoSeen && tourStep === null ? "util-bar__btn--attract" : ""
+              }`}
+              onClick={() => {
+                markDemoSeen();
+                if (tourStep === null) startTour();
+                else exitTour();
+              }}
+              aria-pressed={tourStep !== null}
+              title={
+                tourStep === null
+                  ? "Demo — a guided tour that draws an example building and walks through the whole workflow"
+                  : "Demo — end the tour (everything built so far is kept)"
+              }
+            >
+              Demo
+            </button>
+            {/* IMPORT · EXPORT — the two FILE actions, paired at the end of the bar and
+                mirroring each other: Import brings a PDF / PNG / JPEG in as a reference
+                underlay to trace over (Plan phase, where underlays live), Export writes the
+                selected walls out as a DXF (Elevations, where walls are selectable). Each
+                is disabled in the other's phase, so the pair reads as one in/out control
+                that follows wherever you are. The <input> is hidden because a native file
+                field cannot be styled to match the bar. */}
+            <button
+              className="util-bar__btn"
+              onClick={onImportClick}
+              disabled={unravelOn}
+              title={
+                unravelOn
+                  ? "Import places a reference underlay to trace over — available in the Plan phase"
+                  : "Import a PDF / PNG / JPEG as a reference underlay to trace over"
+              }
+            >
+              Import
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="visually-hidden"
+              accept={ACCEPTED_IMAGE_TYPES}
+              multiple
+              onChange={(e) => void importImageFiles(e.target.files)}
+            />
+            {/* The label stays "Export" even while the marquee is armed — at this width a
+                longer word would ellipsis, and the accent fill already says it is armed. */}
+            <button
+              data-tour="export"
+              className={`util-bar__btn ${exportSelectMode ? "is-active" : ""}`}
+              onClick={toggleExportSelect}
+              disabled={!unravelOn}
+              aria-pressed={exportSelectMode}
+              title={
+                unravelOn
+                  ? "Export — click-drag a box over the panels to select walls, then export to Revit / AutoCAD / Rhino (Esc cancels)"
+                  : "Unroll the geometry first, then export walls"
+              }
+            >
+              Export
+            </button>
+          </div>
+
           {/* EXPORT popup: opens on a non-empty marquee release. Portals into the
               canvas-wrap (stageRef), previews ONLY the selected walls in 3D, and
               downloads a unit-preserving DXF for Revit / AutoCAD / Rhino. */}
@@ -5972,90 +8095,6 @@ export default function PolylineTool() {
               }}
             />
           )}
-          {/* OVERVIEW MAP — small draggable navigator at the BOTTOM-LEFT of the
-              canvas, ABOVE the Floor plate / Subtractive / Additive cluster. Mirrors
-              whatever the main canvas shows — the WHOLE footprint in draw/edit, or the
-              WHOLE unrolled panel strip in the unravel view — fit-to-view plus a
-              rectangle marking the main canvas's current view, so the user can glance
-              the full scope while zoomed in. The overview shares the main view's model
-              space in each mode, so the indicator is meaningful in both. */}
-          <OverviewMap
-            perimeter={perimeter}
-            viewport={viewport}
-            mainSize={{ w: sizeRef.current.w, h: sizeRef.current.h }}
-            gridSpacing={gridSpacing}
-            unravelOn={unravelOn}
-            unravelDraws={unravelDraws}
-            stageRef={wrapRef}
-          />
-          {/* BOTTOM-RIGHT TOOL CLUSTER — floats just LEFT of the "?" help button
-              (anchored in .canvas-wrap). Order: Draw · Edit · Erase · Dim.
-              • Draw / Edit are the perimeter MODE toggle (relocated here from the left
-                Create panel) — Draw places vertices, Edit selects/drags/inserts them.
-              • Erase works in BOTH views: in the building view it deletes the perimeter
-                VERTEX under the cursor (enabled once the first vertex exists); in the
-                unravel view it deletes division lines on the focused panel AND floor
-                plates. While armed, hovering highlights the target; a click removes it
-                (one undo step each). Mutually exclusive with Centerlines/Framing/Floor plate.
-              • Dim is a placeholder button (the word does nothing yet, stays white); only
-                its EYE icon toggles the on-canvas DIMENSION visibility (the single source
-                of truth, unravel views). Disabled in the Building Perimeter tab. */}
-          <div className="bottomright-tools">
-            <button
-              className={`eraser-btn ${phase === "perimeter" && mode === "draw" && !eraserOn ? "is-active" : ""}`}
-              onClick={() => {
-                setMode("draw");
-                if (eraserOn) onEraser();
-              }}
-              disabled={phase !== "perimeter" || perimeter.closed}
-              aria-pressed={phase === "perimeter" && mode === "draw" && !eraserOn}
-              title="Draw — place vertices"
-            >
-              Draw
-            </button>
-            <button
-              className={`eraser-btn ${phase === "perimeter" && mode === "edit" && !eraserOn ? "is-active" : ""}`}
-              onClick={() => {
-                setMode("edit");
-                if (eraserOn) onEraser();
-              }}
-              disabled={phase !== "perimeter"}
-              aria-pressed={phase === "perimeter" && mode === "edit" && !eraserOn}
-              title="Edit — select / drag / insert / delete vertices"
-            >
-              Edit
-            </button>
-            <button
-              className={`eraser-btn ${eraserOn ? "is-active" : ""}`}
-              onClick={onEraser}
-              aria-pressed={eraserOn}
-              title="Erase — delete perimeter vertices (building view) or centerlines / floor lines (unravel view)"
-            >
-              Erase
-            </button>
-            {/* DIM — clicking the word does NOTHING yet (its tool action is undefined);
-                the button stays white. Only its EYE icon controls the on-canvas DIMENSION
-                visibility (panel width / per-column-row / cell labels + the height input
-                fields) across the Elevations, Wall Border, and Cells tabs — the single
-                source of truth, so no view (Clean / Shadows) auto-hides dimensions.
-                Dimensions are VISIBLE by default. Disabled in the Building Perimeter tab
-                (dimensions are an unravel-view overlay). */}
-            <div className="tool-vis-wrap">
-              <button
-                className="eraser-btn has-vis"
-                disabled={!unravelOn}
-                title="Dimensions — use the eye icon to show / hide"
-              >
-                Dim
-              </button>
-              <VisToggle
-                visible={dimensionsVisible}
-                disabled={!unravelOn}
-                onToggle={() => setDimensionsVisible((v) => !v)}
-                label="dimensions"
-              />
-            </div>
-          </div>
           {/* HELP "?" button — floats at the BOTTOM-RIGHT of the canvas (anchored in
               .canvas-wrap like the floor-plate / history clusters). Clicking it opens a
               small submenu ABOVE itself to choose which reference to read; picking one
@@ -6093,186 +8132,62 @@ export default function PolylineTool() {
               </button>
             </div>
           )}
-          <button
-            className={`help-btn ${helpOpen ? "is-active" : ""}`}
-            onClick={() => { setHelpMenuOpen((on) => !on); setHelpPanel(null); }}
-            title="Help & reference"
-            aria-label="Help and reference"
-            aria-haspopup="menu"
-            aria-expanded={helpMenuOpen}
-          >
-            ?
-          </button>
           {/* The selected reference panel. The title (top-left, UPPERCASED by CSS) names
-              the topic; the body renders the matching reference list. Closed by the ×
-              button, the backdrop, or Escape (handled in an effect). The backdrop is a
-              transparent full-canvas click-catcher so an outside click dismisses the
-              panel without darkening the workspace. */}
+              the topic; the body renders the matching reference list. It is a NON-MODAL,
+              STAY-OPEN panel: there is deliberately NO backdrop, so the user can click
+              around the canvas to navigate (pan/zoom, select walls, etc.) while the
+              reference stays visible alongside the on-screen elements it explains. It is
+              closed only by the × button, the Help button, or Escape (handled in an effect). */}
           {helpPanel && (
-            <>
-              <div
-                className="help-backdrop"
-                onPointerDown={closeHelp}
-                aria-hidden="true"
-              />
-              <div
-                className="help-popup"
-                role="dialog"
-                aria-label={HELP_PANEL_TITLE[helpPanel]}
-              >
-                <div className="help-popup__titlebar">
-                  <span className="help-popup__title">{HELP_PANEL_TITLE[helpPanel]}</span>
-                  <button
-                    className="help-popup__close"
-                    onClick={closeHelp}
-                    title="Close (Esc)"
-                    aria-label="Close"
-                  >
-                    ×
-                  </button>
-                </div>
-                <div className="help-popup__body">
-                  {helpPanel === "controls" && <ControlsList />}
-                  {helpPanel === "stats" && <StatisticsInfo />}
-                  {helpPanel === "views" && <ViewModesInfo />}
-                </div>
+            <div
+              className="help-popup"
+              role="dialog"
+              aria-label={HELP_PANEL_TITLE[helpPanel]}
+            >
+              <div className="help-popup__titlebar">
+                <span className="help-popup__title">{HELP_PANEL_TITLE[helpPanel]}</span>
+                <button
+                  className="help-popup__close"
+                  onClick={closeHelp}
+                  title="Close (Esc)"
+                  aria-label="Close"
+                >
+                  ×
+                </button>
               </div>
-            </>
+              <div className="help-popup__body">
+                {helpPanel === "controls" && <ControlsList />}
+                {helpPanel === "stats" && <StatisticsInfo />}
+                {helpPanel === "views" && <ViewModesInfo />}
+              </div>
+            </div>
           )}
-          {/* SETTINGS popup — same chrome as the Solar Study popup; holds the Units
-              category. Anchored in .canvas-wrap (its positioning context) like the
-              other overlays. Saving applies the display unit app-wide (geometry stays
-              in feet — applyUnitSystem only changes formatting/parsing). */}
-          {settingsOpen && (
-            <>
-              <div className="modal-backdrop" onClick={handleSettingsBackdrop} />
-              <Settings
-                onClose={() => setSettingsOpen(false)}
-                stageRef={wrapRef}
-                isFlashing={settingsFlashing}
-                unitSystem={unitSystem}
-                onSave={applyUnitSystem}
-              />
-            </>
-          )}
+          {/* The SETTINGS popup was removed along with its gear button. It existed only to
+              switch the display unit; the app is now FEET-ONLY (see core/units). */}
         </div>
-        <div className="statusbar">
-          <span className="statusbar__item">
-            X {cursorModel ? toDisplayLength(cursorModel.x).toFixed(3) : "—"}
-          </span>
-          <span className="statusbar__item">
-            Y {cursorModel ? toDisplayLength(cursorModel.y).toFixed(3) : "—"}
-          </span>
-          {/* Contextual tool hint (red) — coaches new users on the active tool.
-              See `toolHint` above for the per-tool text. */}
-          {toolHint && <span className="statusbar__hint">{toolHint}</span>}
-          <span className="statusbar__spacer" />
-          {/* Zoom is px per model FOOT; show px per active display unit (× feet-per-unit). */}
-          <span className="statusbar__item">
-            Zoom {(viewport.scale * fromDisplayLength(1)).toFixed(0)} px/{lengthAbbr()}
-          </span>
-        </div>
+        {/* The bottom STATUS BAR (X / Y cursor readout + live zoom) was removed — the
+            stage is now canvas-only, edge to edge. Its two messages moved onto the canvas
+            as the .command-bar under the top-center button row (tool hint + save-failure
+            warning). */}
       </main>
+
+      {/* ===== GUIDED DEMO =====
+          Rendered as a child of .app rather than inside .canvas-wrap on purpose: its card
+          and ring are position:fixed and measure their targets in VIEWPORT coordinates, so
+          they must not sit inside an element that could become a containing block (a
+          transform or filter on an ancestor would silently re-base them). Last in the tree
+          so it paints over every panel and popup, including the Solar Study's modal
+          backdrop. */}
+      {tourStep !== null && (
+        <DemoTour
+          step={TOUR_STEPS[tourStep]}
+          index={tourStep}
+          total={TOUR_STEPS.length}
+          onNext={nextTourStep}
+          onBack={tourStep > 0 ? backTourStep : null}
+          onExit={exitTour}
+        />
+      )}
     </div>
-  );
-}
-
-/**
- * The full controls / keybindings reference. Extracted so the list lives in ONE
- * place — it is rendered inside the help popup (the "?" button at the canvas
- * bottom-right). Previously this lived inline in the left tool panel; moving it
- * here keeps the panel focused on active controls and avoids duplicating the docs.
- */
-function ControlsList() {
-  return (
-    <ul className="help">
-      <li><b>Draw / Edit</b> (bottom-right cluster, left of <b>Erase</b> · <b>Dim</b>) toggle the perimeter mode — <b>Draw</b> places vertices (disabled once the perimeter is closed), <b>Edit</b> selects / drags / inserts / deletes them</li>
-      <li><b>Click</b> place vertex</li>
-      <li><b>Type a number</b> (after the first vertex) sets the next segment's exact <b>length</b> — the cursor aims the direction, the rubber band snaps to the typed length · <b>Enter</b> places the vertex at that length · <b>.</b> for decimals · <b>Backspace</b> edits · <b>Esc</b> cancels the entry · hold <b>Shift</b> to also lock the angle to 15°</li>
-      <li><b>Click-drag</b> pull out curve handles</li>
-      <li><b>A / L</b> arc / line segments</li>
-      <li><b>Click first vertex / Double-click / Enter</b> close</li>
-      <li><b>Esc</b> cancel polyline</li>
-      <li><b>Backspace</b> remove last (draw) / delete selected (edit)</li>
-      <li><b>Shift</b> constrain to 15°</li>
-      <li><b>Crosshairs</b> light-grey guide lines track the cursor across the canvas once you've started a perimeter (drawing or editing its vertices)</li>
-      <li><b>Edit:</b> drag vertex · drag knobs · Alt-drag curve · click segment to insert</li>
-      <li><b>Double-click vertex</b> make corner</li>
-      <li><b>Shift-click a vertex</b> delete it (perimeter view) · or arm <b>Erase</b> and click (or click-drag across) vertices to remove them (the targeted vertices turn red)</li>
-      <li><b>Wheel / pinch</b> zoom (at cursor) · <b>Middle-drag / Right-drag</b> pan</li>
-      <li><b>Ctrl+Z / Ctrl+Y</b> undo / redo (Ctrl+Shift+Z also redoes)</li>
-      <li><b>Ctrl+S</b> save perimeter → mini-window (top-right)</li>
-      <li><b>Statistics</b> (top, next to Redo) opens a dropdown (chevron ▾) of live stats for the current view · enabled only once a <b>closed perimeter</b> exists (re-locks if the shape is reopened) · the dropdown is <b>sticky</b> (stays open as you work; Esc or re-click to close) · pick <b>None</b>, <b>General</b>, <b>Irradiance (W/m²)</b>, or <b>Insolation (kWh/m²)</b> · <b>scroll the wheel over the button</b> to cycle the modes without opening the menu (the two solar diagrams are skipped outside the elevation views) · the selection is <b>shared across views, but only for stats that read on both sides</b> — <b>General</b> carries between the <b>Building Perimeter</b> and the elevation views, while Irradiance / Insolation are wall reads, so the <b>Building Perimeter shows None</b> for them (your pick is remembered and restored on return) · in the unravel view the readout anchors under the <b>left-most</b> elevation, re-anchoring to the <b>selected wall border</b> once you click one · <i>what each mode shows and how it's computed is in the "?" menu's <b>Statistics Info</b></i></li>
-      <li><b>Render</b> · <b>Constraint</b> (top row, just left of the Projects minimap, in line with Undo/Redo) toggle blue when selected / white when deselected like the other tool buttons · enabled only once you leave the <b>Building Perimeter</b> tab (in the elevation/unravel views)</li>
-      <li><b>Export</b> (nav header, between Smart Search and Settings) arms the <b>wall-selection marquee</b> in the elevation/unravel views (blue while armed; disabled in the Building Perimeter tab) · <b>click-drag</b> a box over the panels to select every wall it touches (selected walls highlight <b>green</b>) · <b>release</b> opens the export dialog · <b>Esc</b> cancels</li>
-      <li><b>Export dialog</b> shows a 3D preview of <b>only the selected walls</b> (<b>drag</b> to orbit · drag the title bar to move) · <b>Revit / AutoCAD / Rhino</b> buttons download a <b>DXF</b> that preserves real dimensions in <b>feet</b> · click outside to flash · <b>Esc</b> / <b>×</b> to close</li>
-      <li><b>Unroll Elevations</b> (top tab) unravels the geometry — unrolls edges clockwise into equal-length strips · the <b>Unroll Elevations</b>, <b>Wall Border</b>, and <b>Cells</b> tabs stay disabled until the sketch is saved (<b>＋ Save current sketch</b> in the Projects panel)</li>
-      <li><b>Floor Lines</b> (bottom-left, unravel view) — enabled once the selected panel has a <b>CW Type</b> · <b>click</b> arms the tool to drop horizontal level lines (click the canvas to add, click a line to remove; Esc or re-click to finish) · the <b>eye icon</b> on the button's right edge shows / hides all floor lines without deleting them · the ground <b>0′</b> line is permanent (always present, can't be deleted)</li>
-      <li><b>Floor-plate snap</b> after the first plate above ground, new plates snap to multiples of that floor-to-floor height · <b>Shift</b> bypasses the snap (free / grid placement)</li>
-      <li><b>Unravel:</b> drag a panel top to resize</li>
-      <li><b>Layer navigation:</b> a <b>single click</b> on a panel drills DEEPER (Unroll Elevations → Wall Border) · in the <b>Wall Border</b> tab a click on a cell <b>selects it for typing</b> (the click-to-zoom-into-a-cell drill is currently off) · use the <b>Cells</b> tab to enter the single-cell zoom · <b>click a different panel</b> (while in Wall Border/Cells) switches focus straight to it · <b>click the empty canvas</b> to step one layer BACK (Cells → Wall Border → Unroll Elevations) · it stops at Unroll Elevations — use the <b>Building Perimeter</b> tab to return to the footprint · the top tabs jump directly to a layer · Esc also steps back one layer</li>
-      <li><b>Hover a cell</b> (Panels view, a split panel zoomed-in) highlights the individual grid cell under the cursor, showing the panel is subdivided into navigable cells</li>
-      <li><b>Wall Border view</b> dimensions the focused panel's grid: a <b>width</b> label per column along the top, and a <b>height</b> label per row along the left (the panel's height field is hidden here — drag the top edge to resize)</li>
-      <li><b>Cells</b> (top nav) jumps straight to the cells view — the top-left-most cell of the focused panel, or of the first panel with centerlines · enabled once the sketch is saved and <b>any</b> panel has centerlines (Centerlines tool), from any tab</li>
-      <li><b>Click a cell</b> (<b>Wall Border</b> view) selects it for type assignment (<b>Shift+click</b> = all cells of that Material ID) — the click-to-zoom-into-a-cell drill is currently disabled; use the <b>Cells</b> tab to enter the single-cell zoom</li>
-      <li><b>Cells view</b> dimensions the selected cell on all four sides: a <b>width</b> label on the top and bottom edges, a <b>height</b> label on the left and right edges</li>
-      <li><b>Hover an edge</b> (Assembly view) of the selected cell highlights that edge <b>red</b> (top / right / bottom / left, one at a time) to mark it as selected</li>
-      <li><b>Click a panel</b> (Unroll Elevations) selects + zooms it (its width/height labels turn grey) and enables the <b>CW Type</b> button (bottom-left cluster) — the only cluster button available until a type is assigned · click the empty canvas (or Esc) to step back out</li>
-      <li><b>← / → arrow keys</b> (while zoomed into a wall border) jump to the <b>previous / next border</b> along the strip — the same animated zoom-in as clicking the neighbouring panel, wrapping around the loop · the focused border also lights <b>red on the 3D minimap</b> (as if moused over) so you can track which wall is in focus</li>
-      <li><b>CW Type</b> (first in the bottom-left cluster) assigns the curtain-wall system <b>per panel</b> — select a panel, then click (chevron ▾ marks the menu) to choose <b>Stick System</b> or <b>Unitized System</b> · the button shows the selected panel's "CW Type: <i>name</i>" · assigning a type <b>unlocks the rest of the row — Floor Lines, Centerlines, Framing</b> (all stay disabled until a panel's CW Type is set) · a panel holds only ONE system, so switching its type <b>clears that panel's framing of the other system</b> (its centerlines are kept)</li>
-      <li><b>Framing</b> (last in the bottom-left cluster) becomes available once the selected panel has a CW Type, and acts in the <b>Wall Border</b> tab · with the <b>Stick System</b>, hover a panel's <b>vertical</b> or <b>horizontal</b> grid lines (the hovered set highlights, since they adjust together) then <b>click-drag</b> to set a framing (mullion) offset to <b>either side</b> in <b>0.25′</b> increments — dragging one vertical line offsets ALL vertical lines in that panel the same (likewise for horizontal) · with the tool armed, <b>clicking a different wall border</b> (away from this panel's lines) reframes to it with <b>Framing still in hand</b>, so you can move between borders and keep editing without disarming and re-selecting · <b>clicking the empty white canvas</b> (off any panel) deselects the tool · the <b>eye icon</b> on the button's right edge shows / hides all framing on the canvas without deleting it</li>
-      <li>with the <b>Unitized System</b>, hover a cell's centerlines to highlight the <b>single nearest edge</b> of the cell under the cursor, then <b>click-drag</b> to inset that one edge <b>into the cell</b> in <b>0.25′</b> increments · hold <b>Shift</b> while dragging to inset <b>all four edges</b> of that cell together · each framed edge draws the solid frame face inset into the cell AND turns the affected <b>centerline segment solid</b> on top of the dashed centerline (the framed mullion) · the edit <b>mirrors live to every same-shape (Material ID) cell</b> across all elevations/panels — editing one cell updates all identical cells project-wide (see the <b>View</b> button's Material ID colours / <b>Unique cells</b> count for the groups)</li>
-      <li><b>Select cells</b> (<b>Wall Border</b> tab) — <b>click a cell</b> to select just that one (it highlights blue); <b>click it again</b> to deselect it · <b>Shift+click</b> a cell to select <b>every cell sharing its Material ID</b> across the whole project · a plain click replaces the previous selection · this is what unlocks the <b>Assign</b> button</li>
-      <li><b>Assign</b> (right of Framing) opens a <b>None · Vision · Spandrel · Opaque</b> submenu (drop-up, same rules as the <b>CW Type</b> menu) to assign a glazing type to the <b>selected cells</b> · enabled only while <b>at least one cell is selected</b> (Wall Border tab), blue while the menu is open · each type paints its own <b>hatch</b> on the cell · the <b>eye icon</b> on its right edge shows / hides those hatches and stays clickable <b>whenever any wall border has a type assigned</b> — even with no cell selected (when the Assign button itself is disabled)</li>
-      <li><b>Pick a type</b> (with cells selected) assigns it to <b>every selected cell</b> — one cell, or the whole Material-ID family if you Shift+selected it — in a single undoable step · <b>None</b> clears the type (back to untyped, no hatch) · the active option is marked when the whole selection already shares one type</li>
-      <li><b>Centerlines</b> (enabled once the selected panel has a <b>CW Type</b>) arms the divide tool: hover recommends splitting the panel into <b>equal-width columns</b> (move the cursor to pick the iteration — fewer/wider or more/narrower columns) with a live dimension showing the column width · <b>click</b> places that even split · <b>hold Shift</b> flips the split to <b>equal-height rows</b> (horizontal, with a live row-height dimension); if <b>floor plates</b> cross the panel the rows snap to them — an array line lands on every floor plate and each band between plates is evenly subdivided · with the tool armed, <b>clicking a different wall border</b> reframes to it with <b>Centerlines still in hand</b>, so you can move between borders and keep editing without disarming and re-selecting · <b>clicking the empty white canvas</b> (off any panel) deselects the tool · the <b>eye icon</b> on the button's right edge shows / hides all centerlines on the canvas without deleting them · Esc or re-click the button to finish</li>
-      <li><b>Erase</b> (bottom-right cluster, just left of the <b>?</b> help button) arms the delete tool and works in BOTH views · <b>Building Perimeter view:</b> hover a perimeter <b>vertex</b> (it turns <b>red</b>) and <b>click</b> to delete it, or <b>click-drag</b> across several vertices to remove them all in one stroke (committed as one undo step; dropping below 3 points reopens the shape) · hover a perimeter <b>edge</b> away from its corners (closed shape only) to highlight that segment <b>red</b> and <b>click</b> to remove it — <b>reopening the loop there while keeping both vertices</b> — or <b>click-drag</b> along the boundary to erase several segments at once · any vertex left <b>alone</b> by losing both its walls (e.g. between two erased edges) is <b>auto-deleted</b> too (it pre-highlights red) ·<b>Unravel view:</b> <b>hover</b> near a panel's centerline <em>or</em> a floor plate to highlight it, <b>click</b> deletes it, and <b>click-drag</b> across multiple lines erases them all in one stroke (a fast drag still catches every line on the path), committed as one undo step · erasing a panel's centerline also <b>clears that panel's framing</b> on that axis (the same way adding a centerline does — re-apply framing afterwards), so no frame bars linger along the border without their centerlines · the default <b>0′ ground floor line</b> can't be deleted · Esc or re-click the button to finish · mutually exclusive with Centerlines/Framing/Floor Lines</li>
-      <li><b>Dim</b> (bottom-right cluster, right of Erase) — clicking the word does nothing yet; its <b>eye icon</b> is the single source of truth for the on-canvas <b>dimensions</b> (the panel width / per-column-row / cell labels and the height input fields across the <b>Elevations</b>, <b>Wall Border</b>, and <b>Cells</b> tabs) · click the eye to show / hide them all (visible by default) · disabled in the <b>Building Perimeter</b> tab · <b>no view (Clean / Shadows) auto-hides dimensions</b> — only the Dim eye does</li>
-      <li><b>View</b> (top-left, right of Statistics; unravel view only) <b>click</b> opens a dropdown (chevron ▾) to pick the display mode — purely visual, arms no tool · <b>scroll the wheel over the button</b> to cycle the modes without opening the menu · modes are <b>Technical</b>, <b>Material ID</b>, <b>Orientation Heatmap</b>, <b>Clean</b>, and <b>Shadows</b> · <b>no view ever auto-hides floor lines, centerlines, framing, or dimensions</b> — those four are shown/hidden ONLY by their per-button toggles (the eye icons and the <b>Dim</b> button) · <i>what each mode shows and how it's computed is in the "?" menu's <b>View Modes Info</b></i></li>
-      <li><b>Hover an edge</b> (edit mode) highlights that edge's line on the active mini-window thumbnail · in unravel, hovering a panel lights its wall instead</li>
-      <li><b>Projects panel:</b> click load (fits the shape to the view) · drag preview to rotate · double-click preview for top-down plan view · drag title to move · ☀ toggle a larger <b>Solar Study</b> popup · ✎ rename · <b>⧉ duplicate</b> the whole project (perimeter, elevations, framing — everything) into a new <i>Option</i> · <b>× delete</b> — <b>undoable</b> with Ctrl+Z (Ctrl+Y redoes) · <b>＋ footer</b> (Building Perimeter tab only) saves the current sketch as a new project</li>
-      <li><b>Solar Study</b> (☀ popup) draws a 3D <b>sun-path dome</b> around the massing from real solar geometry · drag to rotate · double-click for an aerial top-down view (synced with the thumbnail) · <b>Orientation dial</b> — drag the needle (or type degrees) to set the drawing's North relative to the cardinal directions · <b>Date</b> and <b>Solar time</b> sliders move the sun along its path (with a live altitude / azimuth readout) · <b>Latitude</b> field (temporary Omaha, NE default until the address is geocoded) · Location field inherits the sketch's address · settings are saved with the sketch</li>
-      <li><b>Overview map</b> (bottom-left) shows the whole shape — the footprint in draw/edit, the unrolled panel strip in unravel — with a rectangle marking your current view · drag the grip strip to move</li>
-      <li><b>Location</b> (left panel) type an address to geo-locate the sketch · optional — blank by default · saved with the sketch</li>
-      <li><b>New project</b> (＋ at the top-left of the nav header, left of <b>Building Perimeter</b>) clears the canvas to a fresh, blank project — like refreshing the page but without the onboarding hint · your <b>saved projects are kept</b></li>
-      <li><b>Settings</b> (⚙ at the top-right of the nav header) opens a draggable Settings popup (drag its title bar to move · Esc or × to close) with a category rail on the left (<b>Units</b>) · under Units, a <b>Feet ′ / Metric m</b> length-unit switch · click <b>Save</b> (bottom-right) to apply the unit to every dimension across the app (drawings, statistics, minimap, elevations, walls, cells) — the geometry is unchanged, only the units shown</li>
-      <li><b>Collapse panel</b> (◂ / ▸ at the bottom-left corner) hides or shows the left tool panel to give the canvas more room</li>
-      <li><b>Edit a loaded entry</b> footprint and elevation-view edits auto-save to that entry (no manual save) · the mini-window's <b>＋ footer</b> always creates a new entry instead</li>
-
-    </ul>
-  );
-}
-
-/**
- * VIEW MODES INFO panel ("?" menu → View Modes Info). One entry per View-button display
- * mode: a plain-language sentence on WHAT it shows, then an italic "How:" clause on how
- * it's computed. Kept in sync with the View dropdown (CELL_VIEW_LABELS) + the renderer.
- */
-function ViewModesInfo() {
-  return (
-    <ul className="help">
-      <li><b>Technical</b> the default drafting view — centerlines, framing, and dimensions on a plain background, no cell tinting. <span className="help__how">How: draws the authored geometry as-is; what's visible is governed only by the Floor Lines / Centerlines / Framing eye toggles and the Dim button.</span></li>
-      <li><b>Material ID</b> tints every grid cell by its geometric <b>shape</b>, so identical cells across the whole project share one colour and number. <span className="help__how">How: each cell's width × height is rounded to ~0.001′ and bucketed into a shape group; the group index maps to a hue via the golden angle (137.5°), and identical cells fan out in saturation. The Statistics <b>Unique cells</b> count is the number of distinct groups.</span></li>
-      <li><b>Orientation Heatmap</b> colours each cell by the <b>compass direction</b> its glass faces and prints that facade's <b>live direct-sun hit %</b> beneath the cardinal. <span className="help__how">How: the facade's outward normal (from the perimeter's winding) is rotated by the Solar Study's North into a true bearing, then mapped onto a cold→hot ramp (N blue · E cyan · S yellow · W red). The % is the cosine of the sun's angle of incidence on the wall — cos(altitude)·cos(sun-azimuth − wall-bearing) at the Solar Study's current day + hour — shown as 100% (sun square-on) down to 0% (grazing or sun behind the wall), or "—" when the sun is below the horizon.</span></li>
-      <li><b>Clean</b> a presentation view — the glass panels fill <b>white</b> behind the framing. <span className="help__how">How: the same geometry as Technical with cell infill forced white; the per-button visibility toggles still apply.</span></li>
-      <li><b>Shadows</b> a 2.5D presentation — every framing bar reads as raised and casts a hard <b>drop shadow</b> onto the adjacent glass. <span className="help__how">How: built on Clean — each frame bar projects a shadow quad onto neighbouring glass only (never onto frame infill), its length scaling with zoom; the geometry is drawn monochrome while hover highlights stay coloured. <b>Opaque</b> cells read as <b>flush with the frame</b>, so no shadow falls on them (Vision and Spandrel glass is recessed and still catches the shadow).</span></li>
-    </ul>
-  );
-}
-
-/**
- * STATISTICS INFO panel ("?" menu → Statistics Info). One entry per Statistics-dropdown
- * mode: a plain-language sentence on WHAT it shows, then an italic "How:" clause on how
- * it's computed. Kept in sync with the Statistics dropdown + core/radiation.ts.
- */
-function StatisticsInfo() {
-  return (
-    <ul className="help">
-      <li><b>General</b> live geometric totals for the current view. <span className="help__how">How: read straight off the drawn geometry — the <b>Building Perimeter</b> shows wall count, perimeter length, footprint area (shoelace formula), and bounding extents; the <b>unravel</b> views show segment count, unwrapped length, total facade area (Σ length × height), and the unique-cell count.</span></li>
-      <li><b>Irradiance (W/m²)</b> a Ladybug-style <b>month × hour</b> heatmap of clear-sky solar power landing on the selected wall. <span className="help__how">How: for each month's representative day and each hour, the sun's altitude/azimuth (spherical astronomy from the Solar Study's latitude + North) drive a Hottel clear-sky beam transmittance; wall irradiance = direct-normal·cos(incidence) (beam, only when the sun faces the wall) + isotropic sky-diffuse + ground-reflected, coloured cold→hot. Clear-sky only (no weather file yet).</span></li>
-      <li><b>Insolation (kWh/m²)</b> the energy companion — a <b>monthly bar chart</b> of the solar energy that same wall receives. <span className="help__how">How: integrates the Irradiance over each representative day and scales by the days in the month → kWh/m² per month; summed over the year it gives the annual <b>kWh/m²·yr</b> total shown on both diagrams.</span></li>
-      <li><b>WWR</b> the <b>Window-to-Wall Ratio</b> of the selected wall border (elevation views only). <span className="help__how">How: the WINDOW is the panel's <b>Vision</b> cells (Spandrel, Opaque, and unassigned cells read as wall, set with the <b>Assign</b> tool); the WALL is the whole panel (width × height). Reported two standard ways — <b>Gross Opening</b> counts each vision cell's full opening (frames/mullions included), <b>Net Glazing</b> counts only the glass infill (frames/mullions excluded). An <b>Assigned N / M</b> line at the bottom shows coverage; until every cell is assigned a type the ratios are flagged <b>provisional</b> (marked <b>*</b>), since unassigned cells are still being counted as wall.</span></li>
-      <li><b>VLT</b> the <b>Visible Light Transmittance</b> of the selected wall border (elevation views only). <span className="help__how">How: each cell type carries an industry-standard VLT — <b>Vision</b> ≈ 70% (clear/low-E vision glass), <b>Spandrel</b> and <b>Opaque</b> = 0% (no visible transmittance). The <b>Effective aperture</b> is the glass-area-weighted transmittance spread over the whole panel (= net WWR × glazing VLT), the standard daylighting metric — light passes only through the actual glass infill. Like WWR, it shows an <b>Assigned N / M</b> coverage line at the bottom and is flagged <b>provisional</b> (<b>*</b>) until the wall border is fully assigned.</span></li>
-    </ul>
   );
 }

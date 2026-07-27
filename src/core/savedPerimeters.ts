@@ -19,6 +19,7 @@ import type { Perimeter } from "./geometry";
 import { perimeterLength, enclosedArea } from "./geometry";
 import { DEFAULT_WALL_HEIGHT_FT } from "./extrude3d";
 import { type SolarSettings } from "./solar";
+import { type ReferenceImage, cloneReferenceImages } from "./referenceImage";
 
 /**
  * The persistent ELEVATION / unwrapped-document state captured alongside the
@@ -87,26 +88,74 @@ export interface SavedElevationState {
 
 /**
  * Optional GEO-LOCATION captured for a sketch via the LOCATION panel section.
- * `address` is the free-text address the user types (the query a geocoder — e.g.
- * the planned Mapbox integration — will resolve); `lat`/`lng` hold resolved
- * coordinates once available (null until a geocoder fills them in). A wholly
- * BLANK location (empty address, null coordinates) means "no geolocation", which
- * is the default so the blank canvas needs no location at all.
+ *
+ * `address` is the free text the user types. Committing it runs the OFFLINE
+ * gazetteer (core/gazetteer.ts), which fills the resolved fields below — no API key
+ * and no network request. A wholly BLANK location (empty address, null coordinates)
+ * means "no geolocation", the default, so a blank canvas needs no location at all.
+ *
+ * The resolved fields are what the Solar Study reads for site latitude, the
+ * solar↔clock time correction, and the radiation model's site elevation. They stay
+ * null when the address matched nothing, so an unresolved address never silently
+ * pretends to be a located site — the UI says so and the study keeps its default.
  */
 export interface LocationInfo {
   address: string;
   lat: number | null;
   lng: number | null;
+  /**
+   * Human-readable resolved place ("Omaha, Nebraska, US"), or null when the address
+   * did not resolve / coordinates were typed directly. Shown next to the field so the
+   * user can always see WHAT the tool matched and correct a wrong guess.
+   */
+  label?: string | null;
+  /** IANA zone of the resolved site, for the clock-time readout. Null when unresolved. */
+  timeZone?: string | null;
+  /** Resolved site elevation in METRES (feeds Hottel transmittance). Null when unresolved. */
+  elevationM?: number | null;
 }
 
-/** A fresh, blank location — the default (no geolocation). */
+/** A fresh, blank location — no geolocation at all. Used when a saved entry predates
+ *  the location feature, or when a location is explicitly cleared. */
 export function emptyLocation(): LocationInfo {
-  return { address: "", lat: null, lng: null };
+  return { address: "", lat: null, lng: null, label: null, timeZone: null, elevationM: null };
+}
+
+/**
+ * The DEFAULT location a new sketch starts with: Omaha, Nebraska. Pre-resolved rather
+ * than left blank so the solar study, sun path, and shadow work are meaningful from the
+ * first click instead of silently reading nothing — the user re-types an address only
+ * when the project is somewhere else. Values are the resolved gazetteer entry (the same
+ * ones the offline lookup returns for "Omaha, NE"), so no resolution round trip is
+ * needed at startup.
+ */
+export function defaultLocation(): LocationInfo {
+  return {
+    // Byte-for-byte what `resolveSite("Omaha, Nebraska, US")` returns, so the default
+    // site is indistinguishable from one the user resolved themselves — same canonical
+    // address in the field, same rounded coordinates, same elevation and zone. Anything
+    // hand-written here would silently disagree with the gazetteer the moment the user
+    // re-committed the field, and the readout would jump.
+    address: "Omaha, Nebraska, US",
+    lat: 41.26,
+    lng: -95.94,
+    label: "Omaha, Nebraska, US",
+    timeZone: "America/Chicago",
+    elevationM: 320,
+  };
 }
 
 /** Deep-copy a location so a stored snapshot is detached from live state. */
 export function cloneLocation(l: LocationInfo): LocationInfo {
-  return { address: l.address, lat: l.lat, lng: l.lng };
+  return {
+    address: l.address,
+    lat: l.lat,
+    lng: l.lng,
+    // Backfilled with null for entries saved before these fields existed.
+    label: l.label ?? null,
+    timeZone: l.timeZone ?? null,
+    elevationM: typeof l.elevationM === "number" ? l.elevationM : null,
+  };
 }
 
 /** True when a location carries no geolocation info at all (the default). */
@@ -153,6 +202,17 @@ export interface SavedPerimeter {
   /** Per-edge curtain-wall system assignment (Stick / Unitized). OPTIONAL so older
    *  entries still load (defaulted to {} on load). */
   panelCwType?: Record<number, CwType>;
+  /**
+   * Optional REFERENCE IMAGES (imported PDF/PNG/JPEG underlays) placed in model space
+   * beneath the drawing. OPTIONAL so older entries still load (defaulted to [] on load).
+   *
+   * Each carries its raster inline as a data URL, so a project is self-contained: it
+   * survives a reload and travels with a duplicate without depending on the original
+   * file still being on disk. That is also why imports are downscaled on the way in —
+   * see MAX_RASTER_PX in core/referenceImage.ts — since this all has to fit in the
+   * localStorage budget shared by every saved project.
+   */
+  referenceImages?: ReferenceImage[];
   /**
    * Optional SOLAR-STUDY settings (the Solar Study popup): the sketch's cardinal
    * orientation (`northOffset`), site latitude/longitude, and the studied day +
@@ -275,6 +335,7 @@ export function makeSavedPerimeter(
   elevation: SavedElevationState,
   existing: SavedPerimeter[],
   location: LocationInfo = emptyLocation(),
+  referenceImages: ReferenceImage[] = [],
 ): SavedPerimeter {
   const elev = cloneElevationState(elevation);
   return {
@@ -294,6 +355,7 @@ export function makeSavedPerimeter(
     unravelHeight: elev.unravelHeight,
     floorPlates: elev.floorPlates,
     location: cloneLocation(location),
+    referenceImages: cloneReferenceImages(referenceImages),
   };
 }
 
@@ -371,13 +433,21 @@ export function loadSaved(): SavedPerimeter[] {
   }
 }
 
-/** Persist the saved list. Swallows quota/serialization errors (best-effort). */
-export function persistSaved(list: SavedPerimeter[]): void {
+/**
+ * Persist the saved list. Returns TRUE on success, FALSE when the write failed —
+ * almost always localStorage's few-MB quota, or a private-mode block.
+ *
+ * The result is reported rather than swallowed because REFERENCE IMAGES made silent
+ * failure dangerous: geometry is small enough that quota was effectively unreachable,
+ * but one imported scan can approach the whole budget. A user whose save is failing
+ * needs to know before they close the tab, so the caller surfaces a warning.
+ */
+export function persistSaved(list: SavedPerimeter[]): boolean {
   try {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-    }
+    if (typeof localStorage === "undefined") return false;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+    return true;
   } catch {
-    /* best-effort: ignore quota / private-mode write failures */
+    return false;
   }
 }

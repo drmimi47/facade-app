@@ -15,6 +15,21 @@ import type { Viewport } from "./viewport";
 import { toScreen } from "./viewport";
 import type { UnravelSegment } from "./unravel";
 import { fmtLengthTick, lengthTick } from "./units";
+import type { ReferenceImage, HandleKey } from "./referenceImage";
+// Grip ORDER only — drawTransformFrame resolves each grip's point from the box it is
+// given, so it serves an underlay and the whole-shape selection alike.
+import { HANDLE_KEYS } from "./referenceImage";
+
+/**
+ * A reference image paired with its decoded bitmap, ready to blit. The decode happens
+ * in the React layer (it is asynchronous); the renderer only ever draws, so a repaint
+ * never awaits. `bitmap` is null while a freshly loaded project's image is still
+ * decoding — that frame simply skips it rather than blocking the whole paint.
+ */
+export interface PlacedReferenceImage {
+  image: ReferenceImage;
+  bitmap: CanvasImageSource | null;
+}
 
 /**
  * Golden-angle hue step (degrees) for the Material-ID cell view. Spacing successive
@@ -197,10 +212,12 @@ export interface UnravelDraw {
     type: "vision" | "spandrel" | "opaque";
   }>;
   /**
-   * SHADOWS view only: the glass-infill rects of OPAQUE cells. An opaque infill panel sits
-   * FLUSH with the frame face (not recessed like vision/spandrel glass), so no cast shadow
-   * lands on it — the renderer punches these rects out of the shadow clip. Independent of the
-   * Type-hatch visibility toggle (it's a property of the assigned type, not a view preference).
+   * SHADOWS view only: the glass-infill rects of OPAQUE cells. Opaque infill sits nearly
+   * FLUSH with the frame face rather than recessed like vision/spandrel glass, so it still
+   * catches a cast shadow — just a much shorter one. The renderer draws the shadows in two
+   * passes: full depth everywhere except these rects, then a short-throw pass clipped TO
+   * them (--frame-shadow-opaque-scale). Independent of the Type-hatch visibility toggle
+   * (it's a property of the assigned type, not a view preference).
    */
   opaqueCells?: Array<{ x0: number; x1: number; y0: number; y1: number }>;
 }
@@ -209,6 +226,25 @@ export interface UnravelDraw {
 export interface RenderState {
   perimeter: Perimeter;
   viewport: Viewport;
+  /**
+   * REFERENCE IMAGES (underlays) to draw BENEATH everything else, in list order, so a
+   * traced site plan sits behind the geometry it is being traced into. Each carries its
+   * already-decoded bitmap — the renderer never decodes, so a repaint stays synchronous.
+   * Undefined/empty in views that do not host underlays. See core/referenceImage.ts.
+   */
+  referenceImages?: PlacedReferenceImage[];
+  /** Id of the selected underlay, whose transform grips are drawn. null when none. */
+  selectedImageId?: string | null;
+  /** Grip the pointer is over, highlighted so the target is unambiguous. */
+  hoveredImageHandle?: HandleKey | null;
+  /**
+   * WHOLE-SHAPE SELECTION (Select tool, Plan phase): the model-space bounds of the drawn
+   * perimeter when it is selected as one object, else null. Drawn with exactly the same
+   * frame + grips as a selected underlay — same control, same look, same gestures.
+   */
+  selectedPerimeterBox?: { x0: number; y0: number; x1: number; y1: number } | null;
+  /** Grip the pointer is over on THAT frame. */
+  hoveredPerimeterHandle?: HandleKey | null;
   /** Live cursor position in MODEL space (already snapped/constrained). */
   cursorModel: Point | null;
   /** True while actively placing vertices (controls the first-vertex affordance). */
@@ -300,13 +336,44 @@ export interface RenderState {
    */
   selectedUnravelPanel?: number;
   /**
+   * UNRAVEL view only: original edge index of the wall border the PANEL-SCOPED statistics
+   * (Irradiance / Insolation / WWR / VLT) are currently reading, or -1/undefined when no
+   * such reading is on screen. Drawn with a red outline OFFSET just outside that panel's
+   * border.
+   *
+   * WHY this exists: those readings describe ONE facade, and until now nothing on the
+   * canvas said which. Worse, with no panel focused they silently fall back to the
+   * LEFT-MOST elevation — a number attributed to a wall the user never picked. The glow
+   * makes the subject of the numbers visible, including in that default case.
+   *
+   * WHY a GLOW rather than an outline on (or beside) the border: the border is already
+   * spoken for — hover paints it red, export-selection green, a curved panel dashes it.
+   * A bloom sits clear of all of them, so every one stays readable at once; it has no
+   * edge to mistake for geometry or for a second selection frame; and reading as ambient
+   * rather than drawn marks it as a persistent annotation instead of transient hover
+   * feedback. It bleeds outward only, so the panel's contents are untouched.
+   */
+  statsAnchorPanel?: number;
+  /**
    * UNRAVEL view, PANELS phase only: edge index of the focused panel to annotate
    * with per-COLUMN width labels (top) and per-ROW height labels (left), or
    * -1/undefined for none. Lets the Panels view dimension the focused panel's full
    * grid (one width per column, one height per row) the way the strip view shows a
    * single overall width per panel. Suppressed in OVERVIEW boundaries-only mode.
+   *
+   * When cells of THIS panel are SELECTED (see {@link selectedCells}) the per-column /
+   * per-row grid is replaced by a dimension on each selected cell instead (its width ×
+   * height), so the labels focus on the cells being inspected.
    */
   cellDimEdge?: number;
+  /**
+   * UNRAVEL view, PANELS phase only: when true (and no cells are selected) the
+   * {@link cellDimEdge} panel is dimensioned with just its OVERALL length + height (one
+   * width label on top, one height label on the left) instead of the per-column / per-row
+   * grid. Toggled on by clicking the empty canvas with nothing selected; the camera does
+   * NOT move. Reset to the grid when cells are selected or another panel is focused.
+   */
+  cellDimOverall?: boolean;
   /**
    * UNRAVEL view, ASSEMBLY phase only: the model-space rectangle of the single
    * SELECTED cell (the one double-clicked into), to annotate with a dimension
@@ -448,6 +515,165 @@ function cssNum(el: HTMLElement, name: string, fallback: number): number {
   return Number.isFinite(v) ? v : fallback;
 }
 
+/**
+ * Paint the canvas GROUND: clear, lay the background, then blit any reference underlays
+ * onto it.
+ *
+ * These are deliberately ONE function rather than two calls at the top of render(),
+ * because the ONLY thing keeping an imported image beneath the drawing is that it is
+ * painted before any geometry — the app has no layer system, so there is no z-order to
+ * fall back on. Pulling the image blit out and calling it from somewhere else is exactly
+ * the edit that would put an underlay over the plan; binding it to the background makes
+ * that a deliberate restructure rather than a one-line slip.
+ *
+ * The selected image's frame and grips are NOT part of this: they are UI, not content,
+ * and draw last so they stay grabbable over the geometry — see
+ * {@link drawReferenceImageFrame}.
+ */
+function drawBackdrop(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  bg: string,
+  viewport: Viewport,
+  placed: PlacedReferenceImage[] | undefined,
+): void {
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, width, height);
+  if (placed && placed.length > 0) drawReferenceImages(ctx, viewport, placed);
+}
+
+/**
+ * Blit the underlay bitmaps. Only ever called by {@link drawBackdrop} — see there for
+ * why the two are bound together.
+ *
+ * Model +Y is UP but screen +Y is DOWN, so the rect's model TOP-LEFT is what maps to
+ * the screen origin of the blit — computing both corners through toScreen keeps that
+ * flip in one place and makes the drawn size follow the zoom for free.
+ */
+function drawReferenceImages(
+  ctx: CanvasRenderingContext2D,
+  viewport: Viewport,
+  placed: PlacedReferenceImage[],
+): void {
+  for (const { image, bitmap } of placed) {
+    if (!bitmap) continue; // still decoding — skip this frame rather than stall the paint
+    const tl = toScreen(viewport, { x: image.x, y: image.y + image.h });
+    const br = toScreen(viewport, { x: image.x + image.w, y: image.y });
+    const w = br.x - tl.x;
+    const h = br.y - tl.y;
+    if (w <= 0 || h <= 0) continue;
+
+    ctx.save();
+    ctx.globalAlpha = image.opacity;
+    // Smoothing on: an underlay is a continuous-tone scan, and at typical zoom it is
+    // being downsampled, where nearest-neighbour would alias badly.
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(bitmap, tl.x, tl.y, w, h);
+    ctx.restore();
+  }
+
+}
+
+/**
+ * The SELECTED underlay's transform frame + resize grips, drawn as a SEPARATE pass from
+ * the images themselves.
+ *
+ * The bitmaps go down first, beneath every piece of geometry — the app has no layer
+ * system, so an underlay is unconditionally the backdrop and the drawing always sits on
+ * top of it. Its HANDLES are not content though, they are UI: buried under an opaque
+ * perimeter fill they would be invisible exactly when the shape being traced covers the
+ * image, which is most of the time. So this runs LAST, over the geometry.
+ */
+type FrameTokens = {
+  refImageFrame: string;
+  refImageFrameW: number;
+  refImageHandle: number;
+  refImageHandleFill: string;
+  refImageHandleHover: string;
+};
+
+/**
+ * Draw a SELECTION FRAME — the box plus its eight transform grips — around a model-space
+ * rect. Shared by the reference-image selection and the whole-perimeter selection so the
+ * two are literally the same chrome: a user who has resized an underlay recognises the
+ * building's grips on sight, and a token change moves both at once.
+ *
+ * `withHandles: false` draws the box alone (a LOCKED underlay), because grips that cannot
+ * be dragged would contradict the lock they are advertising.
+ */
+function drawTransformFrame(
+  ctx: CanvasRenderingContext2D,
+  viewport: Viewport,
+  box: { x0: number; y0: number; x1: number; y1: number },
+  hoveredHandle: HandleKey | null,
+  withHandles: boolean,
+  tk: FrameTokens,
+): void {
+  const tl = toScreen(viewport, { x: box.x0, y: box.y1 });
+  const br = toScreen(viewport, { x: box.x1, y: box.y0 });
+
+  ctx.save();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = tk.refImageFrame;
+  ctx.lineWidth = tk.refImageFrameW;
+  ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+
+  if (!withHandles) {
+    ctx.restore();
+    return;
+  }
+
+  const r = tk.refImageHandle;
+  const midX = (box.x0 + box.x1) / 2;
+  const midY = (box.y0 + box.y1) / 2;
+  const at = (k: HandleKey): Point => {
+    switch (k) {
+      case "nw": return { x: box.x0, y: box.y1 };
+      case "n": return { x: midX, y: box.y1 };
+      case "ne": return { x: box.x1, y: box.y1 };
+      case "e": return { x: box.x1, y: midY };
+      case "se": return { x: box.x1, y: box.y0 };
+      case "s": return { x: midX, y: box.y0 };
+      case "sw": return { x: box.x0, y: box.y0 };
+      case "w": return { x: box.x0, y: midY };
+    }
+  };
+  for (const k of HANDLE_KEYS) {
+    const p = toScreen(viewport, at(k));
+    ctx.beginPath();
+    ctx.rect(p.x - r, p.y - r, r * 2, r * 2);
+    ctx.fillStyle = k === hoveredHandle ? tk.refImageHandleHover : tk.refImageHandleFill;
+    ctx.fill();
+    ctx.strokeStyle = tk.refImageFrame;
+    ctx.lineWidth = tk.refImageFrameW;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawReferenceImageFrame(
+  ctx: CanvasRenderingContext2D,
+  viewport: Viewport,
+  placed: PlacedReferenceImage[],
+  selectedId: string | null,
+  hoveredHandle: HandleKey | null,
+  tk: FrameTokens,
+): void {
+  const sel = placed.find((p) => p.image.id === selectedId);
+  if (!sel) return;
+  const img = sel.image;
+  drawTransformFrame(
+    ctx,
+    viewport,
+    { x0: img.x, y0: img.y, x1: img.x + img.w, y1: img.y + img.h },
+    hoveredHandle,
+    !img.locked,
+    tk,
+  );
+}
+
 export function render(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
@@ -489,6 +715,9 @@ export function render(
     // that sets the shadow's offset (model-space, so it scales with zoom for a 2.5D look).
     frameShadow: cssVar(canvas, "--frame-shadow-color", "rgba(17,22,28,0.30)"),
     frameShadowDepth: cssNum(canvas, "--frame-shadow-depth", 0.4),
+    // Opaque infill is nearly flush with the frame, so its cast shadow is a FRACTION of
+    // the depth recessed glass gets — same direction, much shorter throw.
+    frameShadowOpaqueScale: cssNum(canvas, "--frame-shadow-opaque-scale", 0.25),
     // SHADOWS view is MONOCHROME: the panel outlines and framing faces drop their
     // blue/teal/orange tints for neutral greys (hover highlights stay coloured).
     frameMonoOutline: cssVar(canvas, "--frame-mono-outline", "#4a4a4a"),
@@ -501,6 +730,18 @@ export function render(
     unravelCellSelectFill: cssVar(canvas, "--unravel-cell-select-fill", "rgba(31,111,235,0.18)"),
     // Assembly phase: red stroke for the focused cell's hovered top/right/bottom/left edge.
     unravelEdgeSelect: cssVar(canvas, "--unravel-edge-select", "#e5484d"),
+    // STATISTICS ANCHOR: the soft red GLOW marking the wall border the per-panel readings
+    // (Irradiance / Insolation / WWR / VLT) are reporting. A bloom rather than a frame —
+    // it says "this one" without adding a second hard rectangle next to the panel's own
+    // border, where it competed with the hover / export / curved-panel strokes.
+    // Blur is the glow's reach in CSS px; alpha keeps it a hint rather than a highlight.
+    unravelStatsAnchor: cssVar(canvas, "--unravel-stats-anchor-color", "#d23154"),
+    unravelStatsAnchorBlur: cssNum(canvas, "--unravel-stats-anchor-blur", 14),
+    unravelStatsAnchorAlpha: cssNum(canvas, "--unravel-stats-anchor-alpha", 0.55),
+    // Device-pixel scale of the frame. Canvas shadow blur is specified in DEVICE pixels
+    // and is NOT scaled by the current transform (unlike every coordinate here), so the
+    // glow needs this to keep one apparent size across displays.
+    dpr,
     // Material-ID cell view: HSL saturation / lightness (%) and fill alpha for the
     // procedurally-hued per-cell shape tint (hue itself is golden-angle generated).
     // shadeFalloff is the FRACTION of saturation removed across a shape group, so
@@ -567,13 +808,23 @@ export function render(
     // Gap (px) between the unravel strip's left edge and a floor-plate height
     // label parked to its left (UNRAVEL view only — see drawFloorPlates).
     floorPlateLabelGap: cssNum(canvas, "--floorplate-label-gap", 8),
+    // REFERENCE IMAGE (underlay) transform frame + resize grips. The grip value is a
+    // HALF-SIZE in px, kept in screen units so the grips stay the same physical size
+    // at any zoom — a grab target should not shrink as you zoom out.
+    refImageFrame: cssVar(canvas, "--ref-image-frame-color", "#1f6feb"),
+    refImageFrameW: cssNum(canvas, "--ref-image-frame-width", 1),
+    refImageHandle: cssNum(canvas, "--ref-image-handle-size", 4),
+    refImageHandleFill: cssVar(canvas, "--ref-image-handle-fill", "#ffffff"),
+    refImageHandleHover: cssVar(canvas, "--ref-image-handle-hover", "#1f6feb"),
   };
 
   // Reset transform and clear in device pixels.
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = tk.bg;
-  ctx.fillRect(0, 0, width, height);
+
+  // GROUND: background + any reference underlays, in one call. Everything below this
+  // line is geometry and therefore paints ON TOP of an imported image — that ordering is
+  // the whole z-order guarantee, since the app has no layers. See drawBackdrop.
+  drawBackdrop(ctx, width, height, tk.bg, state.viewport, state.referenceImages);
 
   // NOTE: the grid is intentionally NEVER drawn. `gridSpacing` still drives
   // snapping in the input layer, but there is no grid-display path here.
@@ -588,7 +839,9 @@ export function render(
       state.hoveredUnravelEdge ?? -1,
       state.hoveredUnravelTop ?? -1,
       state.selectedUnravelPanel ?? -1,
+      state.statsAnchorPanel ?? -1,
       state.cellDimEdge ?? -1,
+      state.cellDimOverall ?? false,
       state.hoveredCell ?? null,
       state.selectedCells ?? null,
       state.dividePreview ?? null,
@@ -772,6 +1025,34 @@ export function render(
   // so they are intentionally drawn ONLY in the unravel view (handled in the
   // unravel branch above). The normal draw-perimeter view is a plan/footprint
   // view with no meaningful height datum, so no floor-plate lines are shown here.
+
+  // SELECTED UNDERLAY's frame + grips, LAST of all. The image itself is the backdrop
+  // (drawn before any geometry, since there are no layers to raise it with), but its
+  // handles are UI and have to stay grabbable over whatever is drawn on top of it.
+  // The outline-only navigator returns above, so it never draws these.
+  if (state.referenceImages && state.referenceImages.length > 0) {
+    drawReferenceImageFrame(
+      ctx,
+      state.viewport,
+      state.referenceImages,
+      state.selectedImageId ?? null,
+      state.hoveredImageHandle ?? null,
+      tk,
+    );
+  }
+
+  // The whole-shape selection frame, same treatment and same reason: its grips are UI and
+  // must stay grabbable over whatever the geometry drew on top.
+  if (state.selectedPerimeterBox) {
+    drawTransformFrame(
+      ctx,
+      state.viewport,
+      state.selectedPerimeterBox,
+      state.hoveredPerimeterHandle ?? null,
+      true,
+      tk,
+    );
+  }
 }
 
 /**
@@ -1016,8 +1297,14 @@ function drawUnravel(
   hoveredEdge: number,
   hoveredTop: number,
   selectedEdge: number,
-  /** PANELS phase: edge index of the focused panel to dimension per column/row, or -1. */
+  /** Edge index of the border the per-panel STATISTICS are reading (soft red glow), or -1. */
+  statsAnchorEdge: number,
+  /** PANELS phase: edge index of the focused panel to dimension per column/row, or -1.
+   *  When cells of this panel are selected, each selected cell is dimensioned instead. */
   cellDimEdge: number,
+  /** PANELS phase: when true (and nothing selected), dimension the cellDimEdge panel with
+   *  just its OVERALL length + height instead of the per-column / per-row grid. */
+  cellDimOverall: boolean,
   hoveredCell: { x0: number; x1: number; y0: number; y1: number } | null,
   /** WALL BORDER phase: cells SELECTED for type assignment (each tagged with its edge). */
   selectedCells: Array<{ edge: number; x0: number; x1: number; y0: number; y1: number }> | null,
@@ -1058,11 +1345,16 @@ function drawUnravel(
     unravelCleanFill: string;
     frameShadow: string;
     frameShadowDepth: number;
+    frameShadowOpaqueScale: number;
     frameMonoOutline: string;
     frameMonoFrame: string;
     unravelCellHighlightFill: string;
     unravelCellSelectFill: string;
     unravelEdgeSelect: string;
+    unravelStatsAnchor: string;
+    unravelStatsAnchorBlur: number;
+    unravelStatsAnchorAlpha: number;
+    dpr: number;
     cellViewSat: number;
     cellViewLight: number;
     cellViewAlpha: number;
@@ -1289,6 +1581,42 @@ function drawUnravel(
     ctx.stroke();
     ctx.setLineDash([]);
 
+    // STATISTICS ANCHOR: a soft red GLOW bleeding outward from this panel's border,
+    // marking it as the wall the per-panel readings in the Statistics window describe.
+    //
+    // A glow rather than an outline because this is an ANNOTATION, not a selection: it
+    // reports where a number came from, and it has to say so without reading as another
+    // editable frame or competing with the hover / export / curved strokes the border
+    // already carries. A bloom has no edge to mistake for geometry.
+    //
+    // HOW: canvas has no outer-glow primitive, so the panel rect is FILLED with the glow
+    // colour and its own blurred shadow is what shows — with the panel's interior clipped
+    // away, so the source fill is never painted and only the outward half of the bloom
+    // survives. That keeps the cells, hatches and dimensions inside at their true colours.
+    // Drawn after the border stroke so nothing paints over it. Kept out of the OVERVIEW
+    // boundaries-only mode, which suppresses every other emphasis too.
+    if (!boundariesOnly && seg.index === statsAnchorEdge) {
+      const blur = tk.unravelStatsAnchorBlur;
+      ctx.save();
+      // Even-odd between an outer box (generous enough to hold the whole bloom) and the
+      // panel itself leaves a ring-shaped clip: everything OUTSIDE the panel, nothing in.
+      const pad = blur * 3;
+      ctx.beginPath();
+      ctx.rect(x - pad, y - pad, w + pad * 2, rectH + pad * 2);
+      ctx.rect(x, y, w, rectH);
+      ctx.clip("evenodd");
+      ctx.globalAlpha = tk.unravelStatsAnchorAlpha;
+      ctx.shadowColor = tk.unravelStatsAnchor;
+      // Shadow blur is in DEVICE pixels and ignores the transform, so scale it by hand;
+      // every coordinate above is in CSS pixels and gets the dpr from the CTM.
+      ctx.shadowBlur = blur * tk.dpr;
+      ctx.fillStyle = tk.unravelStatsAnchor;
+      ctx.beginPath();
+      ctx.rect(x, y, w, rectH);
+      ctx.fill();
+      ctx.restore();
+    }
+
     // OVERVIEW boundaries-only: the rectangle outline (+ fill) IS the whole panel
     // here — skip the dimension label, cell/division mullions, divide preview, and
     // hover/selected/top-resize emphasis below.
@@ -1429,13 +1757,13 @@ function drawUnravel(
         // shadow stays attached to the bar (the part beyond the bar's right/bottom edges is
         // the visible cast shadow, bounded by a diagonal). All hulls are wound the same way
         // so a single nonzero fill paints the union once (uniform tone, no compounding).
-        const addHull = (b: Rect) => {
+        const addHull = (b: Rect, dx: number, dy: number) => {
           const x0 = b.x, y0 = b.y, x1 = b.x + b.w, y1 = b.y + b.h;
           ctx.moveTo(x0, y0);
           ctx.lineTo(x1, y0);
-          ctx.lineTo(x1 + ox, y0 + oy);
-          ctx.lineTo(x1 + ox, y1 + oy);
-          ctx.lineTo(x0 + ox, y1 + oy);
+          ctx.lineTo(x1 + dx, y0 + dy);
+          ctx.lineTo(x1 + dx, y1 + dy);
+          ctx.lineTo(x0 + dx, y1 + dy);
           ctx.lineTo(x0, y1);
           ctx.closePath();
         };
@@ -1443,24 +1771,57 @@ function drawUnravel(
         // hulls as a SINGLE path in ONE fill call. Filling once (nonzero winding) paints
         // each covered pixel exactly once, so overlapping shadows read as one flat tone —
         // no darker compounded sections. (No blur — hard, crisp edges.)
-        // OPAQUE cells sit FLUSH with the frame, so no shadow falls on them: punch their
-        // infill rects out of the clip region (even-odd → the panel rect minus those holes).
+        //
+        // TWO PASSES, because OPAQUE cells take a SHORTER shadow: their infill sits nearly
+        // flush with the frame rather than recessed like vision/spandrel glass, so the same
+        // raised bar throws far less onto them.
+        //   1. Everywhere EXCEPT the opaque rects, at full depth — punch those rects out of
+        //      the clip (even-odd → the panel rect minus those holes).
+        //   2. Clipped TO the opaque rects, at --frame-shadow-opaque-scale of the offset.
+        // Each pass fills its own region once, so the two never overlap or compound.
+        const opaque = opaqueCells && opaqueCells.length > 0 ? opaqueCells : null;
+        const opaqueRect = (oc: { x0: number; x1: number; y0: number; y1: number }) => {
+          const a = toScreen(vp, { x: oc.x0, y: oc.y0 });
+          const b = toScreen(vp, { x: oc.x1, y: oc.y1 });
+          return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(b.x - a.x), h: Math.abs(b.y - a.y) };
+        };
+
         ctx.save();
         ctx.beginPath();
         ctx.rect(x, y, w, rectH);
-        if (opaqueCells && opaqueCells.length > 0) {
-          for (const oc of opaqueCells) {
-            const a = toScreen(vp, { x: oc.x0, y: oc.y0 });
-            const b = toScreen(vp, { x: oc.x1, y: oc.y1 });
-            ctx.rect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
+        if (opaque) {
+          for (const oc of opaque) {
+            const r = opaqueRect(oc);
+            ctx.rect(r.x, r.y, r.w, r.h);
           }
         }
         ctx.clip("evenodd");
         ctx.fillStyle = tk.frameShadow;
         ctx.beginPath();
-        for (const b of bars) addHull(b);
+        for (const b of bars) addHull(b, ox, oy);
         ctx.fill();
         ctx.restore();
+
+        // SHORT pass — the opaque cells only. Same colour and direction, a fraction of the
+        // throw. Two successive clips INTERSECT, so this is "the panel rect ∩ the opaque
+        // rects": a shadow can still never escape its own panel.
+        if (opaque && tk.frameShadowOpaqueScale > 0) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(x, y, w, rectH);
+          ctx.clip();
+          ctx.beginPath();
+          for (const oc of opaque) {
+            const r = opaqueRect(oc);
+            ctx.rect(r.x, r.y, r.w, r.h);
+          }
+          ctx.clip();
+          ctx.fillStyle = tk.frameShadow;
+          ctx.beginPath();
+          for (const b of bars) addHull(b, ox * tk.frameShadowOpaqueScale, oy * tk.frameShadowOpaqueScale);
+          ctx.fill();
+          ctx.restore();
+        }
         // Repaint the bars opaque white — removes the hull's bar-footprint portion (so the
         // shadow only shows on glass, meeting the bar's right/bottom edges with no gap) and
         // leaves each member reading as a solid raised bar (the frame faces stroke on top).
@@ -1829,22 +2190,31 @@ function drawUnravel(
       );
     }
 
-    // PANELS phase per-COLUMN / per-ROW dimensions for the focused panel. We label
-    // each grid band so the user sees the resolved width of every column (along the
-    // TOP) and the height of every row (along the LEFT) — the granular counterpart
-    // to the strip view's single width-per-panel label. Boundaries are derived the
-    // SAME way as cellsForEdge / the division mullions above so the labels line up
-    // exactly with the drawn grid (dedupe epsilon 1e-6).
-    if (!boundariesOnly && !dimensionsHidden && seg.index === cellDimEdge) {
+    // PANELS phase dimensions for the FOCUSED panel. Two mutually-exclusive readouts,
+    // chosen by whether any of THIS panel's cells are selected:
+    //   • NO selection  → the per-COLUMN / per-ROW grid (one width per column along the
+    //     TOP, one height per row along the LEFT) — the granular counterpart to the strip
+    //     view's single width-per-panel label.
+    //   • cells SELECTED → a width × height dimension centred on EACH selected cell, so the
+    //     labels focus on the specific cells being inspected instead of the whole grid.
+    // Boundaries are derived the SAME way as cellsForEdge / the division mullions above so
+    // the grid labels line up exactly with the drawn grid (dedupe epsilon 1e-6).
+    const selForPanel = (selectedCells ?? []).filter((sc) => sc.edge === seg.index);
+    if (!boundariesOnly && !dimensionsHidden && seg.index === cellDimEdge && selForPanel.length === 0) {
       const lo = Math.min(seg.x0, seg.x1);
       const hi = Math.max(seg.x0, seg.x1);
       // VERTICAL boundaries: panel borders + equal-cell splits + Subtractive divisions.
       const xs: number[] = [lo, hi];
-      for (let k = 1; k < nCells; k++) xs.push(lo + (hi - lo) * (k / nCells));
-      for (const off of divisions ?? []) xs.push(seg.x0 + off);
       // HORIZONTAL boundaries: baseline + top + interior Subtractive dividers.
       const ys: number[] = [0, h];
-      for (const off of dividersH ?? []) if (off > 0 && off < h) ys.push(off);
+      // OVERALL mode keeps ONLY the outer bounds, so the loops below draw one overall WIDTH
+      // label (top) and one overall HEIGHT label (left). Otherwise add the interior
+      // boundaries for the full per-column / per-row grid breakdown.
+      if (!cellDimOverall) {
+        for (let k = 1; k < nCells; k++) xs.push(lo + (hi - lo) * (k / nCells));
+        for (const off of divisions ?? []) xs.push(seg.x0 + off);
+        for (const off of dividersH ?? []) if (off > 0 && off < h) ys.push(off);
+      }
       // Sort ascending + dedupe so coincident lines never produce a zero-width label.
       const dedupe = (arr: number[]): number[] => {
         const sorted = [...arr].sort((a, b) => a - b);
@@ -1882,6 +2252,37 @@ function drawUnravel(
           fmtLengthTick(vy[j + 1] - vy[j]),
           rowColor,
         );
+      }
+    } else if (!boundariesOnly && !dimensionsHidden && seg.index === cellDimEdge) {
+      // Cells SELECTED on this panel → dimension EACH selected cell on ALL FOUR of its
+      // edges, parked just INSIDE the cell: WIDTH centred against the TOP and BOTTOM edges,
+      // HEIGHT centred against the LEFT and RIGHT edges. Keeping the labels INSIDE is
+      // deliberate — with several cells selected, labels placed outside the edges would
+      // spill onto and overlap the neighbouring cell's labels; inside, each cell's numbers
+      // stay within its own bounds.
+      const cellLabelColor = cssVar(canvas, "--label-text", "#1c2530");
+      const gap = tk.unravelLabelGap;
+      const LABEL_H = 16; // matches drawCenteredLabel's internal plate height
+      for (const sc of selForPanel) {
+        const loX = Math.min(sc.x0, sc.x1);
+        const hiX = Math.max(sc.x0, sc.x1);
+        const loY = Math.min(sc.y0, sc.y1);
+        const hiY = Math.max(sc.y0, sc.y1);
+        const wText = fmtLengthTick(hiX - loX);
+        const hText = fmtLengthTick(hiY - loY);
+        // Screen anchors: each edge's mid-point (model +Y is up, so hiY is the TOP edge).
+        const topMid = toScreen(vp, { x: (loX + hiX) / 2, y: hiY });
+        const botMid = toScreen(vp, { x: (loX + hiX) / 2, y: loY });
+        const leftMid = toScreen(vp, { x: loX, y: (loY + hiY) / 2 });
+        const rightMid = toScreen(vp, { x: hiX, y: (loY + hiY) / 2 });
+        // WIDTH on TOP edge: plate bottom set one gap + its height below the edge → inside.
+        drawCenteredLabel(ctx, canvas, topMid.x, topMid.y + gap + LABEL_H, wText);
+        // WIDTH on BOTTOM edge: plate bottom one gap ABOVE the edge → sits just inside.
+        drawCenteredLabel(ctx, canvas, botMid.x, botMid.y - gap, wText);
+        // HEIGHT on LEFT edge: plate left one gap RIGHT of the edge → inside.
+        drawLeftAlignedLabel(ctx, canvas, leftMid.x + gap, leftMid.y, hText, cellLabelColor);
+        // HEIGHT on RIGHT edge: plate right one gap LEFT of the edge → inside.
+        drawRightAlignedLabel(ctx, canvas, rightMid.x - gap, rightMid.y, hText, cellLabelColor);
       }
     }
   }

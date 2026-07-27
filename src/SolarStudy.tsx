@@ -34,8 +34,12 @@ import {
   sunPosition,
   formatDayOfYear,
   formatHour,
+  solarToClock,
+  clockToSolar,
+  timeZoneAbbrev,
   type SolarSettings,
 } from "./core/solar";
+import { resolveSite, canonicalAddress } from "./core/gazetteer";
 
 /** Drag sensitivity (radians of camera rotation per pixel) — matches the thumbnail. */
 const ROTATE_RAD_PER_PX = 0.01;
@@ -45,6 +49,12 @@ const ELEVATION_LIMIT = 1.45; // ~83°
 const STUDY_MARGIN_PX = 28;
 /** Duration (ms) of the double-click aerial (plan) view animation. */
 const PLAN_ANIM_MS = 290;
+/**
+ * Max fraction of the popup allowed to leave the viewport when dragged, per axis. At 0.5
+ * at least HALF stays on screen in each direction — the popup may roam over the header /
+ * footer and any stage edge, but never disappears more than halfway off the browser window.
+ */
+const OFFSCREEN_MAX_FRAC = 0.5;
 
 interface SolarStudyProps {
   /** The saved entry being studied (its stored massing + location + solar settings). */
@@ -63,27 +73,34 @@ interface SolarStudyProps {
    */
   camera: Camera;
   onCameraChange: (camera: Camera) => void;
-  /** Bounds the popup is dragged within (the canvas stage in CSS px). */
-  stageRef: React.RefObject<HTMLElement>;
   /** When true, plays the attention-flash animation (user clicked outside). */
   isFlashing?: boolean;
 }
 
-/** Resolve an entry's solar settings, inheriting a geocoded latitude/longitude when
- *  the entry has no explicit solar config yet (so the dome uses the best site data
- *  available before Mapbox writes a dedicated solar config). */
+/**
+ * Resolve an entry's solar settings. The entry's own stored study (or fresh defaults)
+ * supplies the north offset and the studied day/time; a RESOLVED LOCATION then
+ * overrides the site fields, because the Location address is the single source of
+ * truth for where the building is. Mirrors `activeSolar` in PolylineTool so the popup
+ * and the canvas can never disagree about the site.
+ */
 function resolveSettings(entry: SavedPerimeter): SolarSettings {
-  if (entry.solar) return cloneSolarSettings(entry.solar);
-  const base = defaultSolarSettings();
-  if (typeof entry.location?.lat === "number") base.latitude = entry.location.lat;
-  if (typeof entry.location?.lng === "number") base.longitude = entry.location.lng;
+  const base = entry.solar ? cloneSolarSettings(entry.solar) : defaultSolarSettings();
+  const loc = entry.location;
+  if (typeof loc?.lat === "number" && typeof loc?.lng === "number") {
+    base.latitude = loc.lat;
+    base.longitude = loc.lng;
+    if (loc.timeZone) base.timeZone = loc.timeZone;
+    if (typeof loc.elevationM === "number") base.elevationM = loc.elevationM;
+  }
   return base;
 }
 
-export default function SolarStudy({ entry, defaultHeight, onClose, onLocationChange, onSolarChange, camera, onCameraChange, stageRef, isFlashing }: SolarStudyProps) {
+export default function SolarStudy({ entry, defaultHeight, onClose, onLocationChange, onSolarChange, camera, onCameraChange, isFlashing }: SolarStudyProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const winRef = useRef<HTMLDivElement>(null);
-  // Position: null means "centred by CSS"; once dragged we switch to explicit px.
+  // Position: null means "centred by CSS"; once dragged we switch to explicit VIEWPORT px
+  // (the popup is position:fixed, so left/top are relative to the browser window).
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const dragRef = useRef<{ offX: number; offY: number } | null>(null);
 
@@ -149,33 +166,54 @@ export default function SolarStudy({ entry, defaultHeight, onClose, onLocationCh
     setAddress(entry.location?.address ?? "");
   }, [entry.id, entry.location?.address]);
 
-  // --- Title-bar drag to reposition (clamped to the stage) — mirrors MiniWindow. ---
+  // Outcome of the last offline resolve, for the readout under the address field.
+  // Seeded from the STORED site so a project that already has one shows it on open.
+  const [geoStatus, setGeoStatus] = useState<"idle" | "resolving" | "resolved" | "missing">(
+    entry.location?.lat != null ? "resolved" : "idle",
+  );
+  useEffect(() => {
+    setGeoStatus(entry.location?.lat != null ? "resolved" : "idle");
+  }, [entry.id, entry.location?.lat]);
+  // Guards against an out-of-order resolve landing after a newer one.
+  const geoSeqRef = useRef(0);
+
+  /**
+   * Which clock the TIME slider speaks. The stored `hour` is always local apparent
+   * SOLAR time (what the astronomy consumes); "clock" only changes how it is presented
+   * and edited, converting through the site's longitude, zone, and the equation of
+   * time. Keeping the stored value in one convention means switching the toggle can
+   * never drift the study.
+   */
+  const [timeMode, setTimeMode] = useState<"solar" | "clock">("solar");
+
+  // --- Title-bar drag to reposition (clamped to the VIEWPORT, half-off allowed). ---
+  // The popup is position:fixed, so it drags against the whole browser window — free to
+  // roam over the header and footer — not confined to the canvas stage.
   const onTitlePointerDown = (e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest("button")) return; // ignore the close button
     const win = winRef.current;
-    const stage = stageRef.current;
-    if (!win || !stage) return;
+    if (!win) return;
     const winRect = win.getBoundingClientRect();
-    const stageRect = stage.getBoundingClientRect();
     dragRef.current = { offX: e.clientX - winRect.left, offY: e.clientY - winRect.top };
-    // Seed explicit position from the current rendered spot so the first move
+    // Seed explicit VIEWPORT position from the current rendered spot so the first move
     // doesn't jump from the CSS-centred location.
-    setPos({ x: winRect.left - stageRect.left, y: winRect.top - stageRect.top });
+    setPos({ x: winRect.left, y: winRect.top });
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     e.preventDefault();
   };
   const onTitlePointerMove = (e: React.PointerEvent) => {
     const drag = dragRef.current;
     const win = winRef.current;
-    const stage = stageRef.current;
-    if (!drag || !win || !stage) return;
-    const stageRect = stage.getBoundingClientRect();
-    let x = e.clientX - stageRect.left - drag.offX;
-    let y = e.clientY - stageRect.top - drag.offY;
-    const maxX = Math.max(0, stageRect.width - win.offsetWidth);
-    const maxY = Math.max(0, stageRect.height - win.offsetHeight);
-    x = Math.min(Math.max(0, x), maxX);
-    y = Math.min(Math.max(0, y), maxY);
+    if (!drag || !win) return;
+    // Desired top-left in VIEWPORT coordinates (position:fixed).
+    let x = e.clientX - drag.offX;
+    let y = e.clientY - drag.offY;
+    // Clamp so at least half the popup stays on screen in each axis: it may overrun the
+    // header / footer and any window edge, but never more than half off the viewport.
+    const marginX = win.offsetWidth * OFFSCREEN_MAX_FRAC;
+    const marginY = win.offsetHeight * OFFSCREEN_MAX_FRAC;
+    x = Math.min(Math.max(-marginX, x), window.innerWidth - marginX);
+    y = Math.min(Math.max(-marginY, y), window.innerHeight - marginY);
     setPos({ x, y });
   };
   const onTitlePointerUp = (e: React.PointerEvent) => {
@@ -262,13 +300,64 @@ export default function SolarStudy({ entry, defaultHeight, onClose, onLocationCh
     });
   }, [entry.perimeter, entry.unravelHeight, entry.unravelHeights, defaultHeight, camera, settings]);
 
-  const commitAddress = (value: string) => {
-    setAddress(value);
+  /**
+   * Commit the typed address: resolve it against the BUNDLED offline gazetteer and
+   * push both the location and the site fields of the solar settings. Runs on Enter /
+   * blur rather than per keystroke so a half-typed name never moves the sun.
+   */
+  const commitAddress = async (value: string) => {
+    const seq = ++geoSeqRef.current;
     const prev = entry.location ?? emptyLocation();
-    // Typing a new address invalidates any previously resolved coordinates; a future
-    // geocoder repopulates them. Keep them as-is here (still null on a blank model).
-    onLocationChange(entry.id, { ...prev, address: value });
+
+    if (value.trim() === "") {
+      setGeoStatus("idle");
+      onLocationChange(entry.id, { ...prev, address: value, lat: null, lng: null, label: null, timeZone: null, elevationM: null });
+      return;
+    }
+
+    setGeoStatus("resolving");
+    const site = await resolveSite(value);
+    if (seq !== geoSeqRef.current) return; // superseded by a newer commit
+
+    if (!site) {
+      setGeoStatus("missing");
+      // Drop stale coordinates so an unresolved address never keeps the old site.
+      onLocationChange(entry.id, { ...prev, address: value, lat: null, lng: null, label: null, timeZone: null, elevationM: null });
+      return;
+    }
+
+    setGeoStatus("resolved");
+    // Auto-populate the field with what was matched, so the box and the site driving
+    // the dome always read as the same thing (mirrors the left panel).
+    const canonical = canonicalAddress(site);
+    setAddress(canonical);
+    onLocationChange(entry.id, {
+      ...prev,
+      address: canonical,
+      lat: site.lat,
+      lng: site.lng,
+      label: site.label,
+      timeZone: site.timeZone,
+      elevationM: site.elevationM,
+    });
+    // Move the study itself onto the resolved site in the same commit, so the dome
+    // redraws for the new latitude immediately.
+    update({
+      latitude: site.lat,
+      longitude: site.lng,
+      timeZone: site.timeZone,
+      elevationM: site.elevationM,
+    });
   };
+
+  // Short zone label ("CDT") for the clock-time controls, recomputed per day so the
+  // study honours daylight saving on the date actually being studied.
+  const tzLabel = timeZoneAbbrev(settings.timeZone, settings.dayOfYear);
+  // The time slider's value in whichever convention is on show.
+  const displayHour =
+    timeMode === "solar"
+      ? settings.hour
+      : solarToClock(settings.hour, settings.longitude, settings.timeZone, settings.dayOfYear);
 
   // Live sun readout (real geometry) for the selected day + time.
   const sun = sunPosition(settings.latitude, settings.dayOfYear, settings.hour);
@@ -360,18 +449,54 @@ export default function SolarStudy({ entry, defaultHeight, onClose, onLocationCh
             </div>
 
             <div className="solar__slider-row">
-              <label className="solar__control-label" htmlFor="solar-time">Solar time</label>
+              {/* The label doubles as the SOLAR/CLOCK switch: click to change which
+                  convention the slider reads and writes. The stored value is always
+                  solar time — see the `timeMode` note above. */}
+              <button
+                className="solar__control-label solar__timemode"
+                onClick={() => setTimeMode((m) => (m === "solar" ? "clock" : "solar"))}
+                title={
+                  timeMode === "solar"
+                    ? "Showing local apparent solar time (noon = sun on the meridian) — click for wall-clock time"
+                    : `Showing wall-clock time at the site (${tzLabel}) — click for solar time`
+                }
+              >
+                {timeMode === "solar" ? "Solar time" : `Clock (${tzLabel})`} ⇄
+              </button>
               <input
                 id="solar-time"
                 className="solar__slider"
                 type="range"
-                min={0}
-                max={24}
+                // In clock mode the travel is the clock window that maps onto solar
+                // 0..24, so the slider's ends are exactly reachable rather than
+                // clamping against a hidden limit.
+                min={timeMode === "solar" ? 0 : solarToClock(0, settings.longitude, settings.timeZone, settings.dayOfYear)}
+                max={timeMode === "solar" ? 24 : solarToClock(24, settings.longitude, settings.timeZone, settings.dayOfYear)}
                 step={0.25}
-                value={settings.hour}
-                onChange={(e) => update({ hour: Number(e.target.value) })}
+                value={displayHour}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  update({
+                    hour:
+                      timeMode === "solar"
+                        ? v
+                        : clockToSolar(v, settings.longitude, settings.timeZone, settings.dayOfYear),
+                  });
+                }}
               />
-              <span className="solar__readout">{formatHour(settings.hour)}</span>
+              <span className="solar__readout">{formatHour(displayHour)}</span>
+            </div>
+
+            {/* The OTHER convention, always visible: a solar study is read against the
+                sun, but scheduled against a clock, and the offset between them is a
+                real quantity the user should be able to see rather than infer. */}
+            <div className="solar__slider-row">
+              <span className="solar__control-label" />
+              <span className="solar__readout solar__readout--muted" title="The same instant in the other time convention">
+                {timeMode === "solar"
+                  ? `= ${formatHour(solarToClock(settings.hour, settings.longitude, settings.timeZone, settings.dayOfYear))} ${tzLabel}`
+                  : `= ${formatHour(settings.hour)} solar`}
+              </span>
             </div>
 
             <div className="solar__slider-row">
@@ -385,7 +510,7 @@ export default function SolarStudy({ entry, defaultHeight, onClose, onLocationCh
                 step={0.25}
                 value={settings.latitude}
                 onChange={(e) => update({ latitude: Math.max(-90, Math.min(90, Number(e.target.value))) })}
-                title="Site latitude (° N) — defaults to Omaha, NE"
+                title="Site latitude (° N) — set by resolving the Location address, or type it directly"
               />
               <span className="solar__readout solar__readout--muted" title="Site coordinates feeding the sun path">
                 {settings.latitude >= 0 ? "N" : "S"} · sun {altDeg >= 0 ? `alt ${altDeg}° · az ${azDeg}°` : "below horizon"}
@@ -401,10 +526,35 @@ export default function SolarStudy({ entry, defaultHeight, onClose, onLocationCh
             className="solar__location-input"
             type="text"
             value={address}
-            placeholder="Address (e.g. 123 Main St, City)"
-            title="Address for the solar study — inherited from the sketch's location; edit to update it"
-            onChange={(e) => commitAddress(e.target.value)}
+            placeholder="Address or 41.26, -95.94"
+            title="Address (or literal coordinates) for the solar study — Enter to resolve offline; inherited from the sketch's location"
+            onChange={(e) => setAddress(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void commitAddress((e.target as HTMLInputElement).value);
+              }
+            }}
+            onBlur={(e) => void commitAddress(e.target.value)}
           />
+          {/* What the offline gazetteer matched — shown so the site driving the dome is
+              never a silent guess. Elevation feeds the radiation model's atmosphere. */}
+          {geoStatus === "resolving" && <div className="solar__location-note">Resolving…</div>}
+          {geoStatus === "missing" && (
+            <div className="solar__location-note solar__location-note--warn">
+              No match — keeping the previous site. Try a nearby larger town, or type
+              coordinates as "41.26, -95.94".
+            </div>
+          )}
+          {geoStatus === "resolved" && entry.location?.label && (
+            <div className="solar__location-note">
+              {/* The field carries the matched place, so only repeat it when it differs
+                  — e.g. the "near <city>" label that typed coordinates resolve to. */}
+              {entry.location.label !== entry.location.address && <>{entry.location.label} · </>}
+              {settings.latitude.toFixed(2)}°, {settings.longitude.toFixed(2)}° ·{" "}
+              {Math.round(settings.elevationM)} m · {settings.timeZone}
+            </div>
+          )}
         </div>
       </div>
     </div>

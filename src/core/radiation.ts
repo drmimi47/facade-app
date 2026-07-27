@@ -27,12 +27,15 @@
  *     the wall's true compass bearing (its outward normal), exactly like the
  *     Orientation Heatmap.
  *
- * What is SIMPLIFIED (and shares core/solar.ts's roadmap to Mapbox accuracy):
+ * What is SIMPLIFIED:
  *   - CLEAR-SKY only: no clouds/weather file (no EPW yet). Values are a clear-day
  *     upper envelope, consistent month-to-month, which is what the comparative
  *     diagram needs. A later step can swap in measured TMY/EPW data behind the same
- *     {@link RadiationMatrix} shape without touching the UI.
+ *     {@link RadiationMatrix} shape without touching the UI. This remains the model's
+ *     dominant error term — far larger than anything site resolution contributes.
  *   - `hour` is LOCAL APPARENT SOLAR TIME (solar noon = 12:00), matching core/solar.ts.
+ *     The Solar Study can DISPLAY it as wall-clock time (see solarToClock there); the
+ *     matrix itself is always built on solar time so its columns stay comparable.
  */
 
 import { sunPosition, wallIncidenceCos, type SolarSettings } from "./solar";
@@ -41,12 +44,19 @@ import { sunPosition, wallIncidenceCos, type SolarSettings } from "./solar";
 const SOLAR_CONSTANT = 1367;
 
 /**
- * Site elevation used by Hottel's transmittance, in KILOMETRES. Omaha (the interim
- * default site) sits at ~0.3 km; until Mapbox supplies a real elevation this constant
- * stands in. Higher sites get a clearer atmosphere (more beam), so this is wired as a
- * single tunable rather than buried in the formula.
+ * Fallback site elevation in KILOMETRES, used only when a saved project predates the
+ * stored `elevationM` field. Live studies take the real elevation from the resolved
+ * site (see {@link SolarSettings.elevationM}), which the offline gazetteer supplies
+ * with every address it resolves.
  */
-const SITE_ALTITUDE_KM = 0.3;
+const FALLBACK_ALTITUDE_KM = 0.3;
+
+/** Site elevation for Hottel's transmittance, in KILOMETRES, from the study settings. */
+function siteAltitudeKm(settings: SolarSettings): number {
+  return typeof settings.elevationM === "number" && Number.isFinite(settings.elevationM)
+    ? settings.elevationM / 1000
+    : FALLBACK_ALTITUDE_KM;
+}
 
 /** Ground reflectance (albedo) for the ground-reflected diffuse term. 0.2 ≈ grass/soil. */
 const GROUND_ALBEDO = 0.2;
@@ -111,7 +121,7 @@ export function wallIrradiance(
   const cosZ = Math.cos(zenith); // = sin(altitude)
   const gon = extraterrestrialNormal(dayOfYear);
 
-  const tauB = hottelBeamTransmittance(zenith, SITE_ALTITUDE_KM);
+  const tauB = hottelBeamTransmittance(zenith, siteAltitudeKm(settings));
   const dni = gon * tauB; // direct normal irradiance (W/m²)
 
   // Liu–Jordan diffuse transmittance correlation → diffuse horizontal irradiance.

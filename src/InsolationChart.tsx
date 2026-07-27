@@ -80,7 +80,7 @@ export default function InsolationChart({ matrix }: InsolationChartProps) {
   return (
     <div className="insolation-chart">
       {/* Title matches the irradiance heatmap + General overlay headings exactly. */}
-      <div className="stats-dropdown__title">Insolation (kWh/m²)</div>
+      {/* No title: the Statistics picker directly above names the reading. */}
       <svg
         className="insolation-chart__svg"
         width={W}

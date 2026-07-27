@@ -13,12 +13,12 @@
  * Interactions (documented in NOTES.md too):
  *   - Click a thumbnail        -> load that perimeter into the editor.
  *   - Drag a thumbnail preview -> orbit its 3D camera (rotate the massing).
+ *   - Phase change (Plan <-> Elevations) -> thumbnails animate aerial <-> 3/4 view.
  *   - Double-click the preview -> animate to a top-down (plan) view; again toggles back.
  *   - Drag a project name      -> reorder the project list.
- *   - Rename (pencil ✎)        -> inline edit, Enter/blur commits.
+ *   - Double-click a name      -> inline rename, Enter/blur commits.
  *   - Delete (×)               -> remove that save (undoable via Ctrl+Z / Redo).
  *   - Drag the title bar       -> reposition the window (clamped to the stage).
- *   - Collapse/expand (▾/▸)    -> hide/show the gallery body.
  *
  * All visual values come from CSS tokens in styles.css (the `MINI-WINDOW`
  * section); nothing visual is hardcoded here.
@@ -28,10 +28,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { Perimeter } from "./core/geometry";
 import type { SavedPerimeter, LocationInfo } from "./core/savedPerimeters";
-import { savedStats } from "./core/savedPerimeters";
 import type { SolarSettings } from "./core/solar";
 import { render3d, DEFAULT_CAMERA, PLAN_CAMERA, type Camera } from "./core/extrude3d";
-import { fmtLength, fmtArea } from "./core/units";
 import { easeInOut, shortestAngleDelta } from "./core/viewport";
 import SolarStudy from "./SolarStudy";
 
@@ -68,15 +66,42 @@ interface MiniWindowProps {
   onLocationChange: (id: string, location: LocationInfo) => void;
   /** Persist edited solar settings (cardinal orientation + study set) onto a saved entry. */
   onSolarChange: (id: string, solar: SolarSettings) => void;
-  /** Footer "+" action: save the current editor sketch as a NEW saved preview. */
-  onSave: () => void;
-  /** Gates the footer "+" — false when the sketch can't be saved (needs ≥2 vertices). */
-  canSave: boolean;
-  /** Whether to SHOW the footer "+ Save" button at all. Saving a new sketch only
-   *  belongs to the Building Perimeter tab, so it's hidden in the elevation views. */
-  showSave: boolean;
+  /** Which saved entry's Solar Study popup is open (id), or null. Controlled by the
+   *  parent so the study can also be opened from the left panel's Display section. */
+  solarId: string | null;
+  /** Set/clear the open Solar Study entry (null closes it). */
+  onSolarIdChange: (id: string | null) => void;
+  /**
+   * True while the ELEVATIONS phase is open. Drives each thumbnail's default camera:
+   * Plan phase shows the AERIAL (top-down) massing, matching what the canvas is
+   * showing, and switching to Elevations animates every thumbnail round to the 3/4
+   * view — so the preview always answers "what am I working on" in the same terms as
+   * the main view. The user can still spin or double-click a thumbnail afterwards.
+   */
+  unravelOn: boolean;
+  /**
+   * EMBEDDED: render just the gallery (and the Solar Study portal), with no window
+   * chrome — no title bar, no drag, no collapse, no absolute positioning. Used when the
+   * project list lives INSIDE another panel's section (Overview ▸ Project) rather than
+   * floating on its own. The list, thumbnails, and every row action behave identically.
+   */
+  embedded?: boolean;
   /** Bounds the window is dragged within (the stage size in CSS px). */
   stageRef: React.RefObject<HTMLElement>;
+  /**
+   * Extra class controlling which column this window is anchored in (e.g. "mini--left").
+   * The window is otherwise identical wherever it sits.
+   */
+  positionClass?: string;
+  /**
+   * DEFAULT position within the stage, used until the user drags the window. Lets the
+   * parent stack this beneath another floating panel whose height it cannot know —
+   * see `projectsAutoPos` in PolylineTool. Once dragged, the internal position wins
+   * permanently and this is ignored.
+   */
+  autoPos?: { x: number; y: number } | null;
+  /** Called on any press inside this window, so the parent can raise it above its siblings. */
+  onBringToFront?: () => void;
   /**
    * Hover-link: original edge index to highlight on the ACTIVE entry's thumbnail
    * (the one whose geometry matches the live shape being unravelled), or -1/none.
@@ -126,19 +151,24 @@ export default function MiniWindow({
   onReorder,
   onLocationChange,
   onSolarChange,
-  onSave,
-  canSave,
-  showSave,
+  solarId,
+  onSolarIdChange,
+  unravelOn,
   stageRef,
+  positionClass,
+  autoPos,
+  embedded,
+  onBringToFront,
   highlightEdge,
   highlightAsLine,
   heights,
   defaultHeight,
   livePerimeter,
 }: MiniWindowProps) {
-  // Which saved entry's Solar Study popup is open (by id), or null. Stored as an id
-  // (not the entry) so rename/edit/delete flow through the live `saved` list.
-  const [solarId, setSolarId] = useState<string | null>(null);
+  // Which saved entry's Solar Study popup is open (by id), or null. CONTROLLED by the
+  // parent: the study is launched from the Statistics window (the
+  // per-row ☀ button here was removed — one launcher, in the panel that owns analysis).
+  // Stored as an id (not the entry) so rename/edit/delete flow through the live list.
   const solarEntry = solarId ? saved.find((s) => s.id === solarId) ?? null : null;
   // SHARED orbit camera for the open Solar Study entry. Both the popup and that
   // entry's thumbnail are driven by it, so rotating either rotates both. Reset to
@@ -152,109 +182,22 @@ export default function MiniWindow({
     setSolarFlashing(true);
     solarFlashTimer.current = setTimeout(() => setSolarFlashing(false), 400);
   };
-  // The ☀ button TOGGLES its study: clicking it while that entry's popup is open
-  // closes it; otherwise it opens (resetting to a clean 3/4 camera). Clicking a
-  // different entry's ☀ switches the open study to that entry.
-  const toggleSolar = (id: string) => {
-    if (solarId === id) {
-      setSolarId(null);
-      return;
-    }
-    setSolarCamera(DEFAULT_CAMERA);
-    setSolarId(id);
-  };
-  // Position: null means "anchored top-right by CSS"; once the user drags it we
-  // switch to explicit left/top coordinates (CSS px within the stage).
-  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
-  const [collapsed, setCollapsed] = useState(false);
+  // Windows are no longer draggable, so position comes from `autoPos` (a computed
+  // stacking offset) or, failing that, the CSS anchor.
   // Drag-to-reorder: which index is being dragged, and which index is the current drop target.
   const [dragIdx, setDragIdx] = useState<number | null>(null);
   const [overIdx, setOverIdx] = useState<number | null>(null);
   const winRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ offX: number; offY: number } | null>(null);
 
-  // --- Title-bar drag to reposition (clamped to the stage) ---
-  const onTitlePointerDown = (e: React.PointerEvent) => {
-    // Ignore drags that start on a button (collapse/expand control).
-    if ((e.target as HTMLElement).closest("button")) return;
-    const win = winRef.current;
-    const stage = stageRef.current;
-    if (!win || !stage) return;
-    const winRect = win.getBoundingClientRect();
-    const stageRect = stage.getBoundingClientRect();
-    dragRef.current = {
-      offX: e.clientX - winRect.left,
-      offY: e.clientY - winRect.top,
-    };
-    // Seed explicit position from the current rendered spot so the first move
-    // doesn't jump from the CSS-anchored location.
-    setPos({ x: winRect.left - stageRect.left, y: winRect.top - stageRect.top });
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    e.preventDefault();
-  };
 
-  const onTitlePointerMove = (e: React.PointerEvent) => {
-    const drag = dragRef.current;
-    const win = winRef.current;
-    const stage = stageRef.current;
-    if (!drag || !win || !stage) return;
-    const stageRect = stage.getBoundingClientRect();
-    let x = e.clientX - stageRect.left - drag.offX;
-    let y = e.clientY - stageRect.top - drag.offY;
-    // Clamp so the window stays fully within the stage.
-    const maxX = Math.max(0, stageRect.width - win.offsetWidth);
-    const maxY = Math.max(0, stageRect.height - win.offsetHeight);
-    x = Math.min(Math.max(0, x), maxX);
-    y = Math.min(Math.max(0, y), maxY);
-    setPos({ x, y });
-  };
-
-  const onTitlePointerUp = (e: React.PointerEvent) => {
-    dragRef.current = null;
-    (e.target as HTMLElement).releasePointerCapture?.(e.pointerId);
-  };
-
-  // Keep the window inside the stage if the stage shrinks (e.g. resize) while a
-  // manual position is set.
-  useEffect(() => {
-    if (!pos) return;
-    const win = winRef.current;
-    const stage = stageRef.current;
-    if (!win || !stage) return;
-    const maxX = Math.max(0, stage.clientWidth - win.offsetWidth);
-    const maxY = Math.max(0, stage.clientHeight - win.offsetHeight);
-    if (pos.x > maxX || pos.y > maxY) {
-      setPos({ x: Math.min(pos.x, maxX), y: Math.min(pos.y, maxY) });
-    }
-  }, [pos, stageRef]);
-
-  const style: React.CSSProperties = pos
-    ? { left: pos.x, top: pos.y, right: "auto" }
+  const placed = autoPos ?? null;
+  const style: React.CSSProperties = placed
+    ? { left: placed.x, top: placed.y, right: "auto" }
     : {};
 
-  return (
-    <div className="mini" ref={winRef} style={style} role="region" aria-label="Saved perimeters">
-      {/* ===== TITLE BAR (drag handle) ===== */}
-      <div
-        className="mini__titlebar"
-        onPointerDown={onTitlePointerDown}
-        onPointerMove={onTitlePointerMove}
-        onPointerUp={onTitlePointerUp}
-      >
-        <span className="mini__title">Projects ({saved.length})</span>
-        <button
-          className="mini__iconbtn"
-          onClick={() => setCollapsed((c) => !c)}
-          title="Expand / collapse"
-          aria-label="Expand / collapse"
-        >
-          {collapsed ? "▸" : "▾"}
-        </button>
-      </div>
-
-      {/* ===== GALLERY BODY ===== */}
-      {!collapsed && saved.length > 0 && (
-        <div className="mini__body">
+  // The gallery itself — identical in both modes.
+  const gallery = saved.length > 0 && (
+        <div className={embedded ? "mini__body mini__body--embedded" : "mini__body"}>
           <ul className="mini__list">
               {saved.map((s, i) => (
                 <Thumb
@@ -265,9 +208,9 @@ export default function MiniWindow({
                   onDelete={onDelete}
                   onDuplicate={onDuplicate}
                   onRename={onRename}
-                  onOpenSolar={toggleSolar}
                   // While this entry's Solar Study is open, its thumbnail shares the
                   // popup's camera (controlled) so rotating one rotates the other.
+                  unravelOn={unravelOn}
                   camera={s.id === solarId ? solarCamera : undefined}
                   onCameraChange={s.id === solarId ? setSolarCamera : undefined}
                   // Only the active entry's geometry matches the live unravelled
@@ -309,31 +252,20 @@ export default function MiniWindow({
               ))}
           </ul>
         </div>
-      )}
+      );
 
+  const solarPortal = (
+    <>
       {/* ===== FOOTER: add the current sketch as a new saved preview =====
-          Pinned at the bottom and rendered (outside the collapse block) so the "+"
-          stays reachable even when the gallery is collapsed. Only shown in the Building
-          Perimeter tab (showSave) — saving a new sketch has no meaning in the elevation
-          views, so the footer is hidden there entirely. */}
-      {showSave && (
-        <div className="mini__footer">
-          <button
-            className="mini__addbtn"
-            onClick={onSave}
-            disabled={!canSave}
-            title="Save project"
-            aria-label="Save current sketch as a new preview"
-          >
-            <span className="mini__addbtn-plus" aria-hidden="true">＋</span> Save
-          </button>
-        </div>
-      )}
+      {/* The footer's project actions (Save · New · Demo) moved to the Overview
+          window's PROJECT section, which now owns naming and saving in one place. This
+          window is the project LIBRARY: it lists, loads, reorders, renames, and deletes. */}
 
-      {/* ===== SOLAR STUDY popup (opened from a row's ☀ button) =====
+      {/* ===== SOLAR STUDY popup (opened from the Statistics window) =====
           Portalled into the STAGE (not nested in this window, which is
-          position:absolute + overflow:hidden) so the popup is a stage-level overlay
-          that positions/drags against the canvas area and is never clipped. */}
+          position:absolute + overflow:hidden) so it is never clipped by this window.
+          The popup itself is position:fixed, so it drags against the whole VIEWPORT —
+          free to roam over the header/footer — clamped only to stay half on screen. */}
       {solarEntry && stageRef.current &&
         createPortal(
           <>
@@ -341,17 +273,44 @@ export default function MiniWindow({
             <SolarStudy
               entry={solarEntry}
               defaultHeight={defaultHeight}
-              onClose={() => setSolarId(null)}
+              onClose={() => onSolarIdChange(null)}
               onLocationChange={onLocationChange}
               onSolarChange={onSolarChange}
               camera={solarCamera}
               onCameraChange={setSolarCamera}
-              stageRef={stageRef}
               isFlashing={solarFlashing}
             />
           </>,
           stageRef.current,
         )}
+    </>
+  );
+
+  // EMBEDDED — no window chrome; the host section supplies the heading and spacing.
+  if (embedded) {
+    return (
+      <>
+        {gallery}
+        {solarPortal}
+      </>
+    );
+  }
+
+  return (
+    <div
+      className={`mini ${positionClass ?? ""}`}
+      ref={winRef}
+      style={style}
+      role="region"
+      aria-label="Saved perimeters"
+      onPointerDownCapture={onBringToFront}
+    >
+      {/* ===== TITLE BAR ===== */}
+      <div className="mini__titlebar">
+        <span className="mini__title">Projects ({saved.length})</span>
+      </div>
+      {gallery}
+      {solarPortal}
     </div>
   );
 }
@@ -364,7 +323,6 @@ interface ThumbProps {
   onDuplicate: (id: string) => void;
   onRename: (id: string, name: string) => void;
   /** Open this entry's Solar Study popup (by id). */
-  onOpenSolar: (id: string) => void;
   /**
    * Optional CONTROLLED orbit camera: when provided (this entry's Solar Study is
    * open) the thumbnail renders and rotates this shared camera instead of its own
@@ -373,6 +331,8 @@ interface ThumbProps {
    */
   camera?: Camera;
   onCameraChange?: (camera: Camera) => void;
+  /** Phase (see MiniWindowProps.unravelOn) — picks this thumbnail's default camera. */
+  unravelOn: boolean;
   /** Edge index to highlight on this thumbnail, or -1 for none. */
   highlightEdge: number;
   /** Draw the highlighted edge as a footprint LINE (true) vs a filled wall PANEL (false). */
@@ -391,18 +351,19 @@ interface ThumbProps {
   onItemDragEnd: () => void;
 }
 
-/** One saved-perimeter row: a live thumbnail + name + stats + actions. */
-function Thumb({ saved, active, onLoad, onDelete, onDuplicate, onRename, onOpenSolar, camera: controlledCamera, onCameraChange, highlightEdge, highlightAsLine, heights, defaultHeight, livePerimeter, isDragOver, onNameDragStart, onItemDragOver, onItemDrop, onItemDragEnd }: ThumbProps) {
+/** One saved-perimeter row: a live thumbnail + name + actions. */
+function Thumb({ saved, active, onLoad, onDelete, onDuplicate, onRename, unravelOn, camera: controlledCamera, onCameraChange, highlightEdge, highlightAsLine, heights, defaultHeight, livePerimeter, isDragOver, onNameDragStart, onItemDragOver, onItemDrop, onItemDragEnd }: ThumbProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(saved.name);
-  const stats = savedStats(saved);
 
   // Per-thumbnail 3D camera the user can spin by dragging on the preview. When a
   // controlled camera is supplied (this entry's Solar Study is open) it takes over
   // so the thumbnail mirrors the popup; otherwise the local one is used. All the
   // existing `camera`/`setCamera` call sites below work unchanged against these.
-  const [localCamera, setLocalCamera] = useState<Camera>(DEFAULT_CAMERA);
+  // Seeded from the PHASE: aerial in Plan, 3/4 in Elevations (see the effect below,
+  // which animates between them whenever the phase changes).
+  const [localCamera, setLocalCamera] = useState<Camera>(unravelOn ? DEFAULT_CAMERA : PLAN_CAMERA);
   const camera = controlledCamera ?? localCamera;
   const setCamera = onCameraChange ?? setLocalCamera;
   // Gesture tracking: rotRef holds the drag start (pointer + camera); movedRef
@@ -412,7 +373,7 @@ function Thumb({ saved, active, onLoad, onDelete, onDuplicate, onRename, onOpenS
   // Plan-view toggle state: tracks INTENT (not float equality of the camera) so a
   // double-click reliably toggles between the angled 3/4 massing and the top-down
   // plan, even mid-animation or after the user has spun the thumb.
-  const [planView, setPlanView] = useState(false);
+  const [planView, setPlanView] = useState(!unravelOn);
   // In-flight double-click camera animation (rAF id), so we can cancel it the
   // moment a new animation or a manual drag starts, and on unmount.
   const animRef = useRef<number | null>(null);
@@ -472,6 +433,25 @@ function Thumb({ saved, active, onLoad, onDelete, onDuplicate, onRename, onOpenS
     setPlanView(next);
     animateCameraTo(next ? PLAN_CAMERA : DEFAULT_CAMERA);
   };
+
+  // PHASE-DRIVEN CAMERA. Switching Plan ↔ Elevations re-aims every thumbnail so the
+  // preview reads in the same terms as the main view: aerial (top-down) while drawing the
+  // footprint, 3/4 massing once the walls are unrolled. Animated with the same easing as
+  // the double-click toggle, and only ON A CHANGE — the initial state is already correct
+  // (see the seeds above), and re-running on mount would fight a restored camera.
+  // A manual drag or double-click afterwards still wins until the next phase change.
+  const prevUnravelRef = useRef(unravelOn);
+  useEffect(() => {
+    if (prevUnravelRef.current === unravelOn) return;
+    prevUnravelRef.current = unravelOn;
+    // The Solar Study owns the camera while it is open for this entry; don't fight it.
+    if (controlledCamera) return;
+    setPlanView(!unravelOn);
+    animateCameraTo(unravelOn ? DEFAULT_CAMERA : PLAN_CAMERA);
+    // animateCameraTo reads the CURRENT camera from this render's closure, which is what
+    // we want as the animation's start point.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unravelOn]);
 
   // Cancel any in-flight animation on unmount (avoid setState-after-unmount).
   useEffect(() => cancelAnim, []);
@@ -645,38 +625,26 @@ function Thumb({ saved, active, onLoad, onDelete, onDuplicate, onRename, onOpenS
             className="mini__name"
             draggable
             onClick={() => onLoad(saved)}
+            // Double-click renames in place. The pencil button was removed from the row;
+            // this keeps renaming available for projects that are NOT the loaded one
+            // (Overview ▸ Project ▸ Name only edits the loaded project).
+            onDoubleClick={() => {
+              setDraft(saved.name);
+              setEditing(true);
+            }}
             onDragStart={onNameDragStart}
-            title="Click to load — drag to re-order"
+            title="Click to load · double-click to rename · drag to re-order"
           >
             {saved.name}
           </button>
         )}
-        <div className="mini__stats">
-          {fmtLength(stats.length, 1)}
-          {saved.perimeter.closed ? ` · ${fmtArea(stats.area, 1)}` : ""}
-        </div>
+        {/* No length / area line here. Those figures are the Statistics window's General
+            reading, and duplicating them on every thumbnail meant two places to read the
+            same number — and two places to keep correct. The row is an IDENTITY (name +
+            preview), not a readout. */}
       </div>
 
       <div className="mini__actions">
-        <button
-          className="mini__iconbtn"
-          onClick={() => onOpenSolar(saved.id)}
-          title="Solar study"
-          aria-label="Solar study"
-        >
-          ☀
-        </button>
-        <button
-          className="mini__iconbtn"
-          onClick={() => {
-            setDraft(saved.name);
-            setEditing(true);
-          }}
-          title="Rename"
-          aria-label="Rename"
-        >
-          ✎
-        </button>
         <button
           className="mini__iconbtn"
           onClick={() => onDuplicate(saved.id)}

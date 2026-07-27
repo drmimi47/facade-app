@@ -148,9 +148,7 @@ export default function RadiationDiagram({ matrix }: RadiationDiagramProps) {
 
   return (
     <div className="radiation-diagram">
-      {/* Title matches the General overlay's heading exactly (stats-dropdown__title:
-          all-caps, dim, same margin below) so the two statistics read consistently. */}
-      <div className="stats-dropdown__title">Irradiance (W/m²)</div>
+      {/* No title: the Statistics picker directly above names the reading. */}
       <svg
         className="radiation-diagram__svg"
         width={W}
