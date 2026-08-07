@@ -322,6 +322,32 @@
   --mini-thumb-height: 130px;             /* Thumbnail canvas height (~1.55×) */
   --mini-plan-outline: rgba(31, 111, 235, 0.55); /* Inset outline marking a thumb that's in top-down/plan view */
 
+  /* === FLOATING PANEL STACKING ORDER ===
+     The floating windows form two COLUMNS (left: Overview → Display; right: utility bar →
+     Statistics → Selected image). They are fixed in place and never overlap, so this order
+     is not about which window wins a collision — it is about whose DROP SHADOW lands where.
+
+     --mini-shadow reaches about 12px below a window, which is further than the gap to the
+     next one down (--props-stack-gap). Left alone, every window in a column casts its
+     shadow onto the top edge of the window beneath it, and the pair reads as one card
+     lying ON another instead of two windows side by side in a column. A shadow should only
+     ever fall on the CANVAS.
+
+     The fix is ordering, not geometry: each window paints ABOVE the one whose shadow
+     reaches it, so its own opaque surface covers that spill. Hence the column runs from
+     the lowest z at the TOP to the highest at the BOTTOM. (The reverse direction needs no
+     handling — the shadow is offset downward, so it reaches barely 4px above a window and
+     never crosses the gap upward.)
+
+     Keep these in this order, and keep every value below the canvas-hint layer (z 40). */
+  --z-util-bar: 10;        /* Head of the right column — nothing sits above it */
+  --z-mini: 11;            /* Overview · Statistics — first window in each column */
+  --z-mini-front: 12;      /* The window pressed most recently, lifted over its column head */
+  --z-mini-stacked: 13;    /* Display · Selected image — stacked BENEATH another window.
+                              Outranks the front-lift deliberately: which window is
+                              physically lower in the column is not something a click
+                              should be able to invert. */
+
   /* === SOLAR STUDY (larger massing popup) ===
      Draggable popup opened from a saved row's ☀ button. Surfaces/border/shadow
      reuse the --mini-* family so light + dark themes work with no extra overrides;
@@ -2066,9 +2092,12 @@ input[type="checkbox"] {
   position: absolute;
   top: var(--mini-offset);
   right: var(--mini-offset);
-  /* Above every floating window, including one raised by .mini--front: a persistent
-     toolbar should never be occluded by a panel dragged over it. */
-  z-index: 13;
+  /* LOWEST of the right column, not highest. It used to sit above every window so a
+     panel dragged over it could not occlude it — but the windows are fixed in place and
+     no longer draggable, so nothing can ever reach it. What it CAN do is drop its shadow
+     onto the Statistics window 8px below, which is the one thing the order has to prevent:
+     Statistics paints over it instead. See the stacking-order block in the tokens. */
+  z-index: var(--z-util-bar);
   /* Matched to the window below it so the two read as one right-hand column. */
   width: var(--mini-width);
   height: var(--util-bar-height);
@@ -2169,7 +2198,7 @@ input[type="checkbox"] {
   border-radius: var(--radius);
   box-shadow: var(--mini-shadow);
   overflow: hidden;
-  z-index: 10;
+  z-index: var(--z-mini);
   backdrop-filter: blur(2px);
 }
 
@@ -2189,7 +2218,9 @@ input[type="checkbox"] {
   right: auto;
   /* Same --mini-width as the right column: ONE token now sets every floating window, so
      the two columns cannot drift out of step if it is ever retuned. */
-  z-index: 11;             /* one above .mini, so dragging one over the other is predictable */
+  /* Same tier as the right column's head: the two columns are side by side and never
+     meet, so neither needs to outrank the other. */
+  z-index: var(--z-mini);
 }
 
 /* The HEAD of each column — Overview on the left, Statistics on the right. Both hold full
@@ -2202,11 +2233,21 @@ input[type="checkbox"] {
   max-height: var(--props-win-max-height);
 }
 
-/* The left window touched most recently, lifted above its sibling. Grabbing a window
-   should bring it forward; without this the two share a z-index and DOM order decides,
-   so dragging Overview over Statistics would slide it behind. */
+/* The window touched most recently, lifted above its column head. */
 .mini--front {
-  z-index: 12;
+  z-index: var(--z-mini-front);
+}
+
+/* A window STACKED BENEATH another in its column — Display under Overview, Selected image
+   under Statistics (both positioned by useStackedBelow in PolylineTool).
+   It paints OVER the window above it, so that window's drop shadow lands on this one's
+   opaque surface instead of showing on top of it. Without this, Overview reads as a card
+   lying on Display rather than as the window above it in a column.
+   Declared AFTER .mini--front, and with a higher value, so it wins both ways: pressing
+   Overview must not be able to lift it over Display and put the shadow back. Which window
+   is physically lower in the column is not something a click should be able to invert. */
+.mini--stacked {
+  z-index: var(--z-mini-stacked);
 }
 
 .mini__titlebar {

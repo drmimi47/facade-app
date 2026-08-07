@@ -7219,7 +7219,10 @@ export default function PolylineTool() {
             Both groups are compact GRIDS rather than stacked rows: as rows they cost ten
             full-width lines for settings that are glanced at, not read. */}
         <div
-          className={`mini mini--left ${frontWin === "display" ? "mini--front" : ""}`}
+          // `mini--stacked` because this sits BENEATH Overview in the left column: it has to
+          // paint over it, or Overview's drop shadow falls across this window's top edge and
+          // the pair reads as one card lying on the other. See styles.css.
+          className={`mini mini--left mini--stacked ${frontWin === "display" ? "mini--front" : ""}`}
           ref={displayWinRef}
           style={displayWinStyle}
           role="region"
@@ -7371,7 +7374,8 @@ export default function PolylineTool() {
             selection, so this is where the user is already looking. */}
         {!unravelOn && (importStatus || selectedImage) && (
           <div
-            className={`mini ${frontWin === "image" ? "mini--front" : ""}`}
+            // Stacked beneath Statistics in the right column — same reason as Display.
+            className={`mini mini--stacked ${frontWin === "image" ? "mini--front" : ""}`}
             ref={imageWinRef}
             style={imageWinStyle}
             role="region"
