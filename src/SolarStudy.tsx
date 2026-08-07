@@ -9,10 +9,11 @@
  * Real data, not decoration: the sun dome (compass rose, season + selected-day
  * sun-path arcs, hour marks, and the live sun) is computed from real solar geometry
  * (core/solar.ts) driven by latitude, day of year, solar time, and the sketch's
- * cardinal orientation (`northOffset`). Latitude/longitude currently default to
- * Omaha, NE (a temporary stand-in) and will later be supplied by the planned Mapbox
- * geocoding of the typed address; the model already stores them so accuracy improves
- * without reworking this UI. Because the dome is drawn in the SAME camera as the
+ * cardinal orientation (`northOffset`). Latitude/longitude come from the BUNDLED
+ * offline gazetteer (core/gazetteer.ts), which resolves the typed address to a real
+ * lat/lng and time zone with no network call. A new sketch starts at Omaha, NE —
+ * a genuine default rather than a placeholder, pre-resolved in core/savedPerimeters.ts
+ * so first paint needs no lookup. Because the dome is drawn in the SAME camera as the
  * massing, rotating the model rotates the whole study, and the persisted north +
  * study set are what a later step will use to encode each facade's cardinal facing.
  *

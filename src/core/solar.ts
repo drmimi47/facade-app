@@ -6,10 +6,10 @@
  * WHY hand-written (per the working agreement): the codebase is deliberately
  * dependency-free and the math here is small and standard (a few trig identities),
  * so pulling in a solar library (SunCalc, etc.) would add a dependency for ~40
- * lines of well-known astronomy. Keeping it here also means the SAME module can
- * later be upgraded for Mapbox-accurate results (real latitude/longitude + a
- * timezone + the equation of time to convert clock time ↔ solar time) WITHOUT
- * touching the renderer or UI — they consume the pure functions below.
+ * lines of well-known astronomy. That separation has already paid off once: real
+ * latitude/longitude, a time zone, and the equation of time (clock time ↔ solar
+ * time) were all added HERE when the offline gazetteer landed, WITHOUT touching the
+ * renderer or UI — they consume the pure functions below.
  *
  * This module is PURE DATA/MATH — no DOM, no React, no canvas.
  *
