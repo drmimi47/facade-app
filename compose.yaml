@@ -1,3 +1,11 @@
+# Compose project name is PINNED. By default Compose derives it from the checkout
+# DIRECTORY name, which changes when the repo/folder is renamed (the self-hosted
+# runner checks out into _work/<repo>/<repo>). Without this, a rename makes Compose
+# treat the deploy as a brand-new stack, leaving the old container running and
+# holding port 5180 so the new one fails to bind. Pinning it keeps every deploy
+# targeting the same stack regardless of path.
+name: oligo
+
 services:
   oligo:
     build: .
