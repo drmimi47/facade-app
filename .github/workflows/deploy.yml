@@ -23,15 +23,14 @@ jobs:
           ALLOWED_HOSTS=${{ vars.ALLOWED_HOSTS }}
           EOF
 
-      # One-time cleanup after the repo rename (Oligo-facade-app -> oligo-a-facade-app).
-      # Compose used to derive its project name from the checkout directory, so the
-      # pre-rename stack is still running on the VM under the project
-      # "oligo-facade-app" and still holds 127.0.0.1:5180. compose.yaml now pins the
-      # project name, but that does not adopt the old stack — without this teardown the
-      # new container cannot bind the port. Safe and idempotent: once the old stack is
-      # gone this matches nothing. Remove this step after one successful deploy.
-      - name: Tear down pre-rename stack
-        run: docker compose -p oligo-facade-app down --remove-orphans || true
+      # Free port 5180 before starting. Repo renames left stacks behind under old
+      # Compose project names (oligo-facade-app, oligo-a-facade-app, ...) that still
+      # hold the port, and `compose up` on the pinned "oligo" project cannot adopt or
+      # evict them. Removing whatever publishes 5180 covers every past and future name
+      # without maintaining a list. It may remove this stack's own container; the next
+      # step recreates it anyway (--force-recreate).
+      - name: Free port 5180
+        run: docker ps -aq --filter publish=5180 | xargs -r docker rm -f
 
       - name: Build & (re)start container
         run: docker compose up -d --build --force-recreate
